@@ -1,0 +1,24 @@
+{
+  "timestamp_utc": "2026-10-24T03:14:42.016532+00:00",
+  "python_version": "3.13.7 (tags/v3.13.7:bcee1c3, Aug 14 2025, 14:15:11) [MSC v.1944 64 bit (AMD64)]",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "library_versions": {
+    "pandas": "2.3.3",
+    "numpy": "2.2.6",
+    "scikit_learn": "1.9.1",
+    "xgboost": "3.4.1",
+    "matplotlib": "3.10.8",
+    "seaborn": "0.13.2",
+    "joblib": "1.6.0"
+  },
+  "pipeline_config": {
+    "dataset_path": "eeg_dataset.csv",
+    "target_col": "brainwave_state",
+    "group_col": "subject_id",
+    "use_group_split": true,
+    "test_size": 0.2,
+    "random_seed": 42,
+    "n_features": 42,
+    "n_classes": 3
+  }
+}
