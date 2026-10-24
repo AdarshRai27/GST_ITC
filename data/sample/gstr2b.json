@@ -1,0 +1,39 @@
+{
+  "gstin": "29ABCDE1234F1Z5",
+  "period": "042024",
+  "invoices": [
+    {
+      "supplier_gstin": "07FGHIJ5678K1Z6",
+      "invoice_number": "GSTR-INV-101",
+      "invoice_date": "2024-04-10",
+      "taxable_value": 4000.00,
+      "cgst": 360.00,
+      "sgst": 360.00,
+      "igst": 0.00,
+      "cess": 0.00,
+      "invoice_type": "B2B"
+    },
+    {
+      "supplier_gstin": "BAD-GSTIN",
+      "invoice_number": "GSTR-INV-102",
+      "invoice_date": "2024-04-12",
+      "taxable_value": 2000.00,
+      "cgst": 180.00,
+      "sgst": 180.00,
+      "igst": 0.00,
+      "cess": 0.00,
+      "invoice_type": "B2B"
+    },
+    {
+      "supplier_gstin": "07JKLMN1234O1P7",
+      "invoice_number": "",
+      "invoice_date": "2024-04-14",
+      "taxable_value": 3000.00,
+      "cgst": 270.00,
+      "sgst": 270.00,
+      "igst": 0.00,
+      "cess": 0.00,
+      "invoice_type": "B2B"
+    }
+  ]
+}

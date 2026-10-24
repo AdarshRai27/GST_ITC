@@ -1,0 +1,83 @@
+{
+  "gstin": "29ABCDE1234F1Z5",
+  "period": "042024",
+  "invoices": [
+    {
+      "supplier_gstin": "29ABCDE1234F1Z5",
+      "invoice_number": "INV-1001",
+      "invoice_date": "2024-04-15",
+      "taxable_value": "5000.00",
+      "cgst": "450.00",
+      "sgst": "450.00",
+      "igst": "0.00",
+      "cess": "0.00",
+      "invoice_type": "B2B"
+    },
+    {
+      "supplier_gstin": "07FGHIJ5678K1Z6",
+      "invoice_number": "INV-2001",
+      "invoice_date": "2024-04-16",
+      "taxable_value": "8000.00",
+      "cgst": "0.00",
+      "sgst": "0.00",
+      "igst": "1440.00",
+      "cess": "0.00",
+      "invoice_type": "B2B"
+    },
+    {
+      "supplier_gstin": "29ABCDE1234F1Z5",
+      "invoice_number": "INV 3001",
+      "invoice_date": "2024-04-17",
+      "taxable_value": "3000.00",
+      "cgst": "270.00",
+      "sgst": "270.00",
+      "igst": "0.00",
+      "cess": "0.00",
+      "invoice_type": "B2B"
+    },
+    {
+      "supplier_gstin": "07FGHIJ5678K1Z6",
+      "invoice_number": "INV-4001",
+      "invoice_date": "2024-04-18",
+      "taxable_value": "5500.00",
+      "cgst": "495.00",
+      "sgst": "495.00",
+      "igst": "0.00",
+      "cess": "0.00",
+      "invoice_type": "B2B"
+    },
+    {
+      "supplier_gstin": "29ABCDE1234F1Z5",
+      "invoice_number": "INV-5001",
+      "invoice_date": "2024-04-19",
+      "taxable_value": "4000.00",
+      "cgst": "0.00",
+      "sgst": "0.00",
+      "igst": "720.00",
+      "cess": "0.00",
+      "invoice_type": "B2B"
+    },
+    {
+      "supplier_gstin": "29ABCDE1234F1Z5",
+      "invoice_number": "INV-8001",
+      "invoice_date": "2024-04-23",
+      "taxable_value": "3500.00",
+      "cgst": "315.00",
+      "sgst": "315.00",
+      "igst": "0.00",
+      "cess": "0.00",
+      "invoice_type": "B2B"
+    },
+    {
+      "supplier_gstin": "29ABCDE1234F1Z5",
+      "invoice_number": "INV-6001-B",
+      "invoice_date": "2024-04-22",
+      "taxable_value": "2500.00",
+      "cgst": "225.00",
+      "sgst": "225.00",
+      "igst": "0.00",
+      "cess": "0.00",
+      "invoice_type": "B2B"
+    }
+  ]
+}

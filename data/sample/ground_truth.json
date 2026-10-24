@@ -1,0 +1,31 @@
+{
+  "purchase_register_file": "purchase_register_synthetic.csv",
+  "gstr2b_file": "gstr2b_synthetic.json",
+  "description": "Synthetic ground truth for Phase 2 deterministic reconciliation testing.",
+  "expected_book_status": {
+    "0": "exact",
+    "1": "exact",
+    "2": "fuzzy",
+    "3": "amount_mismatch",
+    "4": "tax_head_mismatch",
+    "5": "duplicate",
+    "6": "invalid",
+    "7": "unmatched_books",
+    "8": "probable"
+  },
+  "expected_unmatched_gstr2b_indices": [
+    5
+  ],
+  "expected_counts": {
+    "exact": 2,
+    "fuzzy": 1,
+    "amount_mismatch": 1,
+    "tax_head_mismatch": 1,
+    "duplicate": 1,
+    "invalid": 1,
+    "probable": 1,
+    "unmatched_books": 1,
+    "unmatched_gstr2b": 1
+  },
+  "notes": "All data is synthetic. Ground truth is defined independently of the matching implementation."
+}

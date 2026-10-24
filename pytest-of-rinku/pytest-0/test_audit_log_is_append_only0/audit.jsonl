@@ -1,0 +1,2 @@
+{"event_id":"e1","event_type":"run_started","invoice_key":null,"metadata":{},"run_id":"run-1","summary":"first","timestamp":"2024-04-15T10:00:00+00:00"}
+{"event_id":"e2","event_type":"run_completed","invoice_key":null,"metadata":{},"run_id":"run-1","summary":"second","timestamp":"2024-04-15T10:01:00+00:00"}
