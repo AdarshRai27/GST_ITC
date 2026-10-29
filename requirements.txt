@@ -1,4 +1,7 @@
-# Application dependencies (MVP)
+# Install the local project package (src-layout)
+-e .
+
+# Application dependencies
 streamlit>=1.35,<2.0
 pandas>=2.2,<3.0
 numpy>=1.26,<2.3
