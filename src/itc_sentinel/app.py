@@ -1,14 +1,22 @@
-"""ITC Sentinel — Streamlit MVP UI (Phase 5).
+"""ITC Sentinel — Streamlit MVP UI.
 
-Provides the complete end-to-end user workflow for GST ITC reconciliation:
-- File upload for purchase register (CSV/XLSX) and GSTR-2B JSON
-- Deterministic reconciliation using existing pipeline modules
-- Decision support, review workflow, vendor drafts, and Excel export
-- Clear disclaimers and uncertainty labeling throughout
+End-to-end workflow for GST ITC reconciliation:
+
+- File upload for purchase register (CSV/XLSX) and GSTR-2B JSON, with safe
+  temporary-file handling (see :mod:`itc_sentinel.uploads`).
+- Deterministic reconciliation, decision support, human review, vendor drafts,
+  and Excel export.
+- Stable per-record review identity, policy-controlled review actions, and
+  metrics that never count mismatches as confirmed matches.
+
+This is a decision-support demo, not an automated GST filing system. A match
+does not establish ITC eligibility; all eligibility statuses remain
+provisional pending Chartered Accountant validation of the tax rules.
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -25,12 +33,37 @@ from itc_sentinel.audit import (
     _utc_now_iso,
     new_audit_log,
 )
-from itc_sentinel.decision import DecisionSettings, decide
-from itc_sentinel.ingest import load_gstr2b_json, load_purchase_register
-from itc_sentinel.matcher import MatchStatus, ReconciliationSettings, reconcile
+from itc_sentinel.decision import (
+    DecisionResult,
+    DecisionSettings,
+    allowed_review_decisions,
+    decide,
+    validate_review_decision,
+)
+from itc_sentinel.ingest import (
+    IngestionError,
+    load_gstr2b_json,
+    load_purchase_register,
+)
+from itc_sentinel.matcher import (
+    MatchResult,
+    MatchStatus,
+    ReconciliationResult,
+    ReconciliationSettings,
+    reconcile,
+    record_identity,
+)
 from itc_sentinel.messages import _decision_to_category, draft_vendor_message
+from itc_sentinel.metrics import ReconciliationMetrics, compute_metrics
 from itc_sentinel.normalize import normalize_records
 from itc_sentinel.report import export_workbook
+from itc_sentinel.uploads import (
+    GSTR2B_EXTENSIONS,
+    PURCHASE_EXTENSIONS,
+    UploadValidationError,
+    cleanup_paths,
+    save_uploaded_file,
+)
 
 # ---------------------------------------------------------------------------
 # Page configuration
@@ -42,52 +75,425 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+_STATUS_LABELS: dict[MatchStatus, str] = {
+    MatchStatus.EXACT: "Exact match",
+    MatchStatus.AMOUNT_MISMATCH: "Amount mismatch",
+    MatchStatus.TAX_HEAD_MISMATCH: "Tax-head mismatch",
+    MatchStatus.FUZZY: "Fuzzy candidate",
+    MatchStatus.PROBABLE: "Probable candidate",
+    MatchStatus.LOW_CONFIDENCE: "Low-confidence candidate",
+    MatchStatus.UNMATCHED_BOOKS: "Unmatched (books)",
+    MatchStatus.UNMATCHED_GSTR2B: "Unmatched (GSTR-2B)",
+    MatchStatus.DUPLICATE: "Duplicate row",
+    MatchStatus.INVALID: "Invalid row",
+}
+
+_STATUS_NOTES: dict[MatchStatus, str] = {
+    MatchStatus.EXACT: (
+        "Same GSTIN, invoice number, date, and amounts. A candidate for an ITC "
+        "claim only; matching is not proof of eligibility."
+    ),
+    MatchStatus.AMOUNT_MISMATCH: (
+        "Same GSTIN and invoice number, but monetary values differ. Requires "
+        "vendor clarification."
+    ),
+    MatchStatus.TAX_HEAD_MISMATCH: (
+        "Same GSTIN and invoice number, but tax is under a different head "
+        "(domestic CGST/SGST vs IGST). Flag for review."
+    ),
+    MatchStatus.FUZZY: (
+        "Invoice numbers share an alphanumeric core but differ in formatting. "
+        "Verify invoice identity before any ITC action."
+    ),
+    MatchStatus.PROBABLE: (
+        "Low-confidence similarity-based match. Not a confirmed match."
+    ),
+    MatchStatus.LOW_CONFIDENCE: (
+        "Auto-detected below the confidence threshold. Requires human review."
+    ),
+    MatchStatus.UNMATCHED_BOOKS: (
+        "No matching GSTR-2B invoice found. May affect an ITC claim; requires "
+        "human review."
+    ),
+    MatchStatus.UNMATCHED_GSTR2B: (
+        "No matching purchase-register invoice (GSTR-2B only). No books-side "
+        "action required."
+    ),
+    MatchStatus.DUPLICATE: (
+        "Duplicate purchase-register row (same GSTIN + invoice). May cause "
+        "double claiming."
+    ),
+    MatchStatus.INVALID: (
+        "Row failed Phase 1 validation. Preserved for review; no ITC action can "
+        "be determined from invalid data."
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
-# Session-state initialisation (once per Streamlit run)
+# Paths and run lifecycle
 # ---------------------------------------------------------------------------
-if "run_id" not in st.session_state:
-    st.session_state.run_id = str(uuid.uuid4())
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
-if "audit_log_path" not in st.session_state:
-    runs_dir = Path("data/runs")
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    st.session_state.audit_log_path = str(
-        runs_dir / f"{st.session_state.run_id}/audit.jsonl"
-    )
-    st.session_state.audit_log = new_audit_log(st.session_state.audit_log_path)
 
-    st.session_state.review_records: list[ReviewRecord] = []
+def _data_root() -> Path:
+    override = os.environ.get("ITC_SENTINEL_DATA_DIR")
+    if override:
+        return Path(override).resolve()
+    return _repo_root() / "data"
 
-    # Audit: record run start
-    st.session_state.audit_log.append(
+
+def _sample_dir() -> Path:
+    override = os.environ.get("ITC_SENTINEL_SAMPLE_DIR")
+    if override:
+        return Path(override).resolve()
+    return _repo_root() / "data" / "sample"
+
+
+def _runs_root() -> Path:
+    return _data_root() / "runs"
+
+
+def _start_new_run() -> None:
+    """Rotate to a fresh run: new identity, audit log, and review state.
+
+    Rotating on every reconciliation request keeps reviews, metrics, and audit
+    events from mixing data across runs in the same browser session.
+    """
+    run_id = str(uuid.uuid4())
+    run_dir = _runs_root() / run_id
+    audit_path = run_dir / "audit.jsonl"
+    audit_log = new_audit_log(audit_path)
+
+    st.session_state.run_id = run_id
+    st.session_state.audit_log_path = str(audit_path)
+    st.session_state.audit_log = audit_log
+    st.session_state.review_records = []
+    st.session_state._pipeline_done = False
+    st.session_state._reconciliation_result = None
+    st.session_state._decisions = None
+    st.session_state._metrics = None
+    st.session_state._drafts = []
+    st.session_state._export_bytes = None
+    st.session_state._export_audited = False
+
+    audit_log.append(
         AuditEvent(
             event_id=str(uuid.uuid4()),
             timestamp=_utc_now_iso(),
             event_type=AuditEventType.RUN_STARTED,
-            run_id=st.session_state.run_id,
-            summary="Streamlit session started",
+            run_id=run_id,
+            summary="Reconciliation run started",
         )
     )
 
 
+if "run_id" not in st.session_state:
+    _start_new_run()
+
+
+def _record_event(
+    event_type: AuditEventType,
+    summary: str,
+    *,
+    invoice_key: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    audit_log = st.session_state.get("audit_log")
+    if audit_log is None:
+        return
+    try:
+        audit_log.append(
+            AuditEvent(
+                event_id=str(uuid.uuid4()),
+                timestamp=_utc_now_iso(),
+                event_type=event_type,
+                run_id=st.session_state.run_id,
+                invoice_key=invoice_key,
+                summary=summary,
+                metadata=metadata or {},
+            )
+        )
+    except OSError:
+        # Auditing must not crash the UI; the failure is surfaced separately.
+        st.warning("The local audit log could not be written for this action.")
+
+
 # ---------------------------------------------------------------------------
-# Disclaimer banner (sidebar)
+# Pipeline helpers
+# ---------------------------------------------------------------------------
+def _execute_pipeline(
+    purchase_file: str | Path,
+    gstr2b_file: str | Path,
+) -> tuple[ReconciliationResult, list[DecisionResult]]:
+    """Run ingestion → normalization → matching → decisions.
+
+    Raises the underlying exception (with context added by the caller) when a
+    stage fails. No Streamlit calls are made here, so the function is easy to
+    exercise in tests.
+    """
+    purchase_raw = load_purchase_register(str(purchase_file))
+    gstr2b_raw = load_gstr2b_json(str(gstr2b_file))
+
+    purchase_normalized = normalize_records(
+        purchase_raw.raw_records,
+        purchase_raw.source_type,
+        purchase_raw.source_file,
+    )
+    gstr2b_normalized = normalize_records(
+        gstr2b_raw.raw_records,
+        gstr2b_raw.source_type,
+        gstr2b_raw.source_file,
+    )
+
+    result = reconcile(
+        purchase_normalized,
+        gstr2b_normalized,
+        ReconciliationSettings(),
+    )
+    decisions = [
+        decide(match, decision_settings=DecisionSettings())
+        for match in result.matches
+    ]
+    return result, decisions
+
+
+def _generate_drafts(decisions: list[DecisionResult]) -> list:
+    drafts = []
+    for decision in decisions:
+        try:
+            if _decision_to_category(decision) is None:
+                continue
+            drafts.append(draft_vendor_message(decision, enhanced_by_llm=False))
+        except ValueError:
+            continue
+    return drafts
+
+
+def _record_to_invoice_key(match: MatchResult) -> str | None:
+    record = match.purchase_record or match.gstr2b_record
+    if record is None:
+        return None
+    return _invoice_key(record.gstin, record.invoice_number)
+
+
+def _display_label(decision: DecisionResult) -> str:
+    match = decision.match_result
+    record = match.purchase_record or match.gstr2b_record
+    gstin = (record.gstin or "—") if record is not None else "—"
+    invoice = (record.invoice_number or "—") if record is not None else "—"
+    side = "books" if match.purchase_record is not None else "2B"
+    return (
+        f"{_STATUS_LABELS[match.match_status]} · {gstin} | {invoice} "
+        f"· {side} row {record_identity(match)}"
+    )
+
+
+def _latest_reviews_by_record(review_records: list[ReviewRecord]) -> dict[str, str]:
+    latest: dict[str, str] = {}
+    for record in review_records:
+        key = record.record_id or f"invoice:{record.invoice_key or ''}"
+        latest[key] = record.decision
+    return latest
+
+
+def _latest_state_for(
+    review_records: list[ReviewRecord],
+    decision: DecisionResult,
+) -> str:
+    record_id = record_identity(decision.match_result)
+    invoice_key = _record_to_invoice_key(decision.match_result)
+    state = "none"
+    for record in review_records:
+        matches = record.record_id == record_id or (
+            not record.record_id
+            and record.invoice_key
+            and record.invoice_key == invoice_key
+        )
+        if matches:
+            state = record.decision
+    return state
+
+
+def _status_dataframe(result: ReconciliationResult, decisions: list[DecisionResult]):
+    decision_by_id = {
+        record_identity(d.match_result): d for d in decisions
+    }
+    rows = []
+    for match in result.matches:
+        record_id = record_identity(match)
+        decision = decision_by_id.get(record_id)
+        record = match.purchase_record or match.gstr2b_record
+        rows.append(
+            {
+                "Record ID": record_id,
+                "GSTIN": (record.gstin or "") if record is not None else "",
+                "Invoice #": (
+                    record.invoice_number or ""
+                    if record is not None
+                    else ""
+                ),
+                "Source": "books" if match.purchase_record is not None else "2B",
+                "Vendor": (
+                    (match.purchase_record.vendor_name or "")
+                    if match.purchase_record is not None
+                    else ""
+                ),
+                "Match Status": match.match_status.value,
+                "Confidence": (
+                    f"{match.confidence:.2f}" if match.confidence else "N/A"
+                ),
+                "Amount Difference": (
+                    str(match.amount_difference)
+                    if match.amount_difference is not None
+                    else "—"
+                ),
+                "Tax Head Mismatch": "Yes" if match.tax_head_difference else "No",
+                "Discrepancies": (
+                    "; ".join(match.discrepancies) if match.discrepancies else "—"
+                ),
+                "Review Required": (
+                    "Yes" if decision is not None and decision.review_required else "No"
+                ),
+                "Reason": match.reason,
+            }
+        )
+    columns = [
+        "Record ID",
+        "GSTIN",
+        "Invoice #",
+        "Source",
+        "Vendor",
+        "Match Status",
+        "Confidence",
+        "Amount Difference",
+        "Tax Head Mismatch",
+        "Discrepancies",
+        "Review Required",
+        "Reason",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _metric_definition_rows(metrics: ReconciliationMetrics) -> list[dict]:
+    return [
+        {
+            "KPI": "Reconciliation rows",
+            "Count": metrics.total_reconciliation_rows,
+            "Definition": (
+                "One row per reconciliation result. A matched pair counts once, "
+                "not twice."
+            ),
+        },
+        {
+            "KPI": "Source rows",
+            "Count": metrics.total_source_rows,
+            "Definition": "Underlying purchase-register + GSTR-2B records.",
+        },
+        {
+            "KPI": "Confirmed matches (exact)",
+            "Count": metrics.confirmed_matches,
+            "Definition": (
+                "Exact matches only. Amount mismatches, tax-head mismatches, "
+                "fuzzy/probable matches, duplicates, invalid and unmatched rows "
+                "are NOT confirmed."
+            ),
+        },
+        {
+            "KPI": "Amount mismatches",
+            "Count": metrics.amount_mismatches,
+            "Definition": "Monetary differences on the same GSTIN + invoice.",
+        },
+        {
+            "KPI": "Tax-head mismatches",
+            "Count": metrics.tax_head_mismatches,
+            "Definition": "Domestic CGST/SGST versus IGST on the same invoice.",
+        },
+        {
+            "KPI": "Fuzzy candidates",
+            "Count": metrics.fuzzy_candidates,
+            "Definition": "Invoice formatting variants; not confirmed matches.",
+        },
+        {
+            "KPI": "Probable candidates",
+            "Count": metrics.probable_candidates,
+            "Definition": "Similarity-based candidates; never confirmed.",
+        },
+        {
+            "KPI": "Low-confidence candidates",
+            "Count": metrics.low_confidence_candidates,
+            "Definition": "Below the confidence threshold; requires review.",
+        },
+        {
+            "KPI": "Duplicates",
+            "Count": metrics.duplicates,
+            "Definition": "Purchase-register rows repeating a GSTIN + invoice.",
+        },
+        {
+            "KPI": "Invalid rows",
+            "Count": metrics.invalid_records,
+            "Definition": "Rows that failed ingestion/normalization validation.",
+        },
+        {
+            "KPI": "Unmatched (books)",
+            "Count": metrics.unmatched_books,
+            "Definition": "Purchase-register rows with no GSTR-2B counterpart.",
+        },
+        {
+            "KPI": "Unmatched (GSTR-2B)",
+            "Count": metrics.unmatched_gstr2b,
+            "Definition": "GSTR-2B rows with no purchase-register counterpart.",
+        },
+        {
+            "KPI": "Review required",
+            "Count": metrics.review_required,
+            "Definition": "Records whose decision has review_required=True.",
+        },
+        {
+            "KPI": "Reviewed records",
+            "Count": metrics.reviewed_records,
+            "Definition": (
+                "Unique review-required records with at least one review; the "
+                "latest decision per record wins."
+            ),
+        },
+        {
+            "KPI": "Awaiting review",
+            "Count": metrics.awaiting_review,
+            "Definition": "Review-required records with no recorded review.",
+        },
+        {
+            "KPI": "Accepted / Rejected / Pending",
+            "Count": metrics.accepted + metrics.rejected + metrics.pending,
+            "Definition": (
+                f"Latest review state: {metrics.accepted} accepted, "
+                f"{metrics.rejected} rejected, {metrics.pending} pending."
+            ),
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Sidebar: input selection
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.title("ℹ️ About ITC Sentinel")
     st.markdown(
         f"""
         **ITC Sentinel** v{__version__}
-        
+
         GST Input Tax Credit reconciliation MVP — deterministic Python pipeline,
         rule-based decision support, human review, template-based vendor drafts,
         and Excel export with audit trail.
-        
+
         ⚠️ **Important disclaimers:**
         - This is a reconciliation and decision-support *demo*, not an automated
           GST filing system.
         - A match does **not** establish ITC eligibility. All eligibility statuses
           are **UNCERTAIN** pending Chartered Accountant verification of tax rules.
+        - Exact matches are *candidates* for an ITC claim and still require
+          human review.
         - A discrepancy alone does **not** establish wrongdoing.
         - Unverified tax assumptions are explicitly provisional.
         - LLM enhancement is opt-in and disabled by default. Drafts require human
@@ -97,669 +503,644 @@ with st.sidebar:
         """
     )
 
-
-# ---------------------------------------------------------------------------
-# Sidebar: file input / sample data selector
-# ---------------------------------------------------------------------------
-st.sidebar.title("📥 Input Data")
-
-use_sample = st.sidebar.checkbox(
-    "Use synthetic sample data", value=True,
-    help="Loads synthetic purchase_register + GSTR-2B for demo purposes."
-)
-
-if use_sample:
-    purchase_path = "data/sample/purchase_register_synthetic.csv"
-    gstr2b_path = "data/sample/gstr2b_synthetic.json"
-else:
-    purchase_path = st.sidebar.file_uploader(
-        "Purchase register (CSV or XLSX)",
-        type=["csv", "xlsx"],
-        help="Supported columns: gstin, invoice_number, invoice_date, taxable_value, cgst, sgst, igst, cess, vendor_name",
-    )
-    gstr2b_path = st.sidebar.file_uploader(
-        "GSTR-2B JSON",
-        type=["json"],
-        help="Supported structure: {gstin, period, invoices:[{supplier_gstin, invoice_number, invoice_date, taxable_value, cgst, sgst, igst, cess, invoice_type}]}",
+    st.title("📥 Input Data")
+    use_sample = st.checkbox(
+        "Use synthetic sample data",
+        value=True,
+        help="Loads the synthetic purchase register + GSTR-2B demo files.",
+        key="use_sample_data",
     )
 
-# ---------------------------------------------------------------------------
-# Run reconciliation action
-# ---------------------------------------------------------------------------
-if st.sidebar.button("▶️ Run Reconciliation", type="primary"):
-
-    purchase_file = (
-        purchase_path if use_sample else str(purchase_path)
-        if isinstance(purchase_path, str) else None
-    )
-    gstr2b_file = (
-        gstr2b_path if use_sample else str(gstr2b_path)
-        if isinstance(gstr2b_path, str) else None
-    )
-
-    if purchase_file is None or gstr2b_file is None:
-        st.sidebar.error("Please select/upload both files before running reconciliation.")
+    if use_sample:
+        purchase_upload = None
+        gstr2b_upload = None
     else:
-        with st.status("🔎 Running reconciliation pipeline…", state="running") as status:
+        purchase_upload = st.file_uploader(
+            "Purchase register (CSV or XLSX)",
+            type=["csv", "xlsx"],
+            help=(
+                "Required columns: gstin, invoice_number, invoice_date, "
+                "taxable_value. Optional: cgst, sgst, igst, cess, vendor_name."
+            ),
+            key="purchase_uploader",
+        )
+        gstr2b_upload = st.file_uploader(
+            "GSTR-2B JSON",
+            type=["json"],
+            help=(
+                "Expected: {gstin, period, invoices:[{supplier_gstin, "
+                "invoice_number, invoice_date, taxable_value, cgst, sgst, "
+                "igst, cess, invoice_type}]}"
+            ),
+            key="gstr2b_uploader",
+        )
 
-            # 1. Ingest
-            try:
-                pr_result = load_purchase_register(purchase_file)
-                gb_result = load_gstr2b_json(gstr2b_file)
-                st.write(f"Purchase register: {pr_result.row_count} raw records")
-                st.write(f"GSTR-2B: {gb_result.row_count} raw records")
-            except Exception as e:
-                st.sidebar.error(f"Ingestion failed: {e}")
-                status.update(label="Ingestion failed", state="error")
-                st.stop()
+    run_clicked = st.button(
+        "▶️ Run Reconciliation", type="primary", key="run_reconciliation"
+    )
 
-            # 2. Normalize
-            try:
-                purchase_normalized = normalize_records(
-                    pr_result.raw_records,
-                    pr_result.source_type,
-                    pr_result.source_file,
+
+# ---------------------------------------------------------------------------
+# Run reconciliation
+# ---------------------------------------------------------------------------
+if run_clicked:
+    _start_new_run()
+    temp_paths: list[str] = []
+    try:
+        if use_sample:
+            purchase_file: str | Path = _sample_dir() / "purchase_register_synthetic.csv"
+            gstr2b_file: str | Path = _sample_dir() / "gstr2b_synthetic.json"
+            for candidate in (purchase_file, gstr2b_file):
+                if not Path(candidate).is_file():
+                    raise IngestionError(
+                        f"Sample file not found: {candidate}. Run from the "
+                        "repository root or set ITC_SENTINEL_SAMPLE_DIR."
+                    )
+        else:
+            if purchase_upload is None or gstr2b_upload is None:
+                raise UploadValidationError(
+                    "Please upload both the purchase register and the GSTR-2B "
+                    "JSON before running reconciliation."
                 )
-                gstr2b_normalized = normalize_records(
-                    gb_result.raw_records,
-                    gb_result.source_type,
-                    gb_result.source_file,
-                )
-            except Exception as e:
-                st.sidebar.error(f"Normalization failed: {e}")
-                status.update(label="Normalization failed", state="error")
-                st.stop()
-
-            st.write(f"Purchase normalized: {len(purchase_normalized)} records")
-            st.write(f"GSTR-2B normalized: {len(gstr2b_normalized)} records")
-
-            # 3. Reconcile
-            try:
-                result = reconcile(
-                    purchase_normalized,
-                    gstr2b_normalized,
-                    ReconciliationSettings(),
-                )
-            except Exception as e:
-                st.sidebar.error(f"Reconciliation failed: {e}")
-                status.update(label="Reconciliation failed", state="error")
-                st.stop()
-
-            # 4. Decide
-            try:
-                decisions = [
-                    decide(m, decision_settings=DecisionSettings())
-                    for m in result.matches
-                ]
-            except Exception as e:
-                st.sidebar.error(f"Decision support failed: {e}")
-                status.update(label="Decision support failed", state="error")
-                st.stop()
-
-            # 5. Audit: record run completion
-            st.session_state.audit_log.append(
-                AuditEvent(
-                    event_id=str(uuid.uuid4()),
-                    timestamp=_utc_now_iso(),
-                    event_type=AuditEventType.RUN_COMPLETED,
-                    run_id=st.session_state.run_id,
-                    summary="Reconciliation run completed",
-                )
+            upload_dir = _runs_root() / st.session_state.run_id / "uploads"
+            purchase_file = save_uploaded_file(
+                purchase_upload,
+                upload_dir,
+                PURCHASE_EXTENSIONS,
+                kind="purchase",
             )
+            temp_paths.append(purchase_file)
+            gstr2b_file = save_uploaded_file(
+                gstr2b_upload,
+                upload_dir,
+                GSTR2B_EXTENSIONS,
+                kind="gstr2b",
+            )
+            temp_paths.append(gstr2b_file)
 
-            # 6. Store everything in session state
-            st.session_state._reconciliation_result = result
-            st.session_state._decisions = decisions
-            st.session_state._pipeline_done = True
-
+        with st.status(
+            "🔎 Running reconciliation pipeline…", state="running"
+        ) as status:
+            result, decisions = _execute_pipeline(purchase_file, gstr2b_file)
             status.update(label="Pipeline complete", state="complete")
 
+        st.session_state._reconciliation_result = result
+        st.session_state._decisions = decisions
+        st.session_state._metrics = compute_metrics(
+            result, decisions, st.session_state.review_records
+        )
+        st.session_state._drafts = _generate_drafts(decisions)
+        st.session_state._pipeline_done = True
+        _record_event(
+            AuditEventType.RUN_COMPLETED,
+            (
+                f"Reconciliation completed: {len(result.matches)} reconciliation "
+                f"rows, {sum(1 for d in decisions if d.review_required)} requiring "
+                "review"
+            ),
+            metadata={
+                "row_count": len(result.matches),
+                "review_required": sum(1 for d in decisions if d.review_required),
+            },
+        )
         st.rerun()
+    except (UploadValidationError, IngestionError, OSError, ValueError) as exc:
+        _record_event(
+            AuditEventType.ERROR,
+            f"Reconciliation failed: {type(exc).__name__}",
+            metadata={"error_type": type(exc).__name__},
+        )
+        st.error(f"Could not run reconciliation: {exc}")
+    except Exception as exc:  # defensive: never leave a half-built run visible
+        _record_event(
+            AuditEventType.ERROR,
+            f"Unexpected reconciliation failure: {type(exc).__name__}",
+            metadata={"error_type": type(exc).__name__},
+        )
+        st.error(
+            "Reconciliation failed unexpectedly. Check the input files and try "
+            f"again. ({type(exc).__name__})"
+        )
+    finally:
+        cleanup_paths(temp_paths)
 
 
 # ---------------------------------------------------------------------------
-# If pipeline has completed, show the dashboard tabs
+# Dashboard
 # ---------------------------------------------------------------------------
-if st.session_state.get("_pipeline_done", False) and st.session_state.get("_reconciliation_result", None) is not None:
-
-    result = st.session_state._reconciliation_result
-    decisions = st.session_state._decisions
-
-    # ---- Build summary stats ----
-    summary = result.summary
-    total_rows = len(result.matches)
-    review_required_count = sum(1 for d in decisions if d.review_required)
-    exposure_total = sum(
-        (d.exposure_amount for d in decisions if d.exposure_amount is not None),
-        Decimal("0"),
+if (
+    st.session_state.get("_pipeline_done", False)
+    and st.session_state.get("_reconciliation_result") is not None
+):
+    result: ReconciliationResult = st.session_state._reconciliation_result
+    decisions: list[DecisionResult] = st.session_state._decisions
+    review_records: list[ReviewRecord] = st.session_state.review_records
+    metrics: ReconciliationMetrics = compute_metrics(
+        result, decisions, review_records
     )
+    st.session_state._metrics = metrics
 
-    # ------------------------------------------------------------------
-    # TAB LAYOUT
-    # ------------------------------------------------------------------
     tab_summary, tab_exceptions, tab_messages, tab_export = st.tabs(
         ["📊 Summary", "⚠️ Exceptions", "📨 Vendor Messages", "📄 Export & Audit"]
     )
 
     # ==================================================================
-    # TAB 1: SUMMARY
+    # Summary
     # ==================================================================
     with tab_summary:
         st.title("📊 Reconciliation Summary")
+        st.caption(
+            "Counts are by reconciliation result row unless stated otherwise. "
+            "A matched pair is one row. Mismatches are never counted as "
+            "confirmed matches."
+        )
 
-        # KPI row
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Total Records", total_rows)
+            st.metric("Reconciliation rows", metrics.total_reconciliation_rows)
         with col2:
-            confirmed = (
-                summary.get("exact", 0)
-                + summary.get("amount_mismatch", 0)
-                + summary.get("tax_head_mismatch", 0)
-                + summary.get("fuzzy", 0)
-            )
-            st.metric("Confirmed Matches", confirmed)
+            st.metric("Confirmed matches (exact)", metrics.confirmed_matches)
         with col3:
-            st.metric("Under Review", review_required_count)
+            st.metric(
+                "Mismatches (amount + tax head)",
+                metrics.amount_mismatches + metrics.tax_head_mismatches,
+            )
         with col4:
+            st.metric("Awaiting review", metrics.awaiting_review)
+
+        col5, col6, col7, col8 = st.columns(4)
+        with col5:
+            st.metric(
+                f"Reviewed ({metrics.review_completion_ratio:.0%})",
+                metrics.reviewed_records,
+            )
+        with col6:
+            st.metric("Review required", metrics.review_required)
+        with col7:
+            st.metric("Fuzzy / probable", metrics.fuzzy_candidates + metrics.probable_candidates)
+        with col8:
             st.metric(
                 "Exposure (provisional)",
-                f"₹{exposure_total.quantize(Decimal('0.01'))}",
+                f"₹{metrics.provisional_exposure.quantize(Decimal('0.01'))}",
             )
 
         st.markdown("#### Match Status Breakdown")
-        status_labels = {
-            "exact": (
-                "Exact Matches",
-                "Same GSTIN, invoice number, date, and amounts. ITC claim is "
-                "*provisional*—matching is not proof of eligibility.",
-            ),
-            "amount_mismatch": (
-                "Amount Mismatches",
-                "Same GSTIN and invoice number, but monetary values differ. "
-                "Requires vendor clarification.",
-            ),
-            "tax_head_mismatch": (
-                "Tax-Head Mismatches",
-                "Same GSTIN and invoice number, but tax is under a different head "
-                "(domestic CGST/SGST vs IGST). Flag for review.",
-            ),
-            "fuzzy": (
-                "Fuzzy Matches",
-                "Invoice numbers share an alphanumeric core but differ in formatting. "
-                "Verify invoice identity before claiming ITC.",
-            ),
-            "probable": (
-                "Probable Matches",
-                "Low-confidence similarity-based match. **Not a confirmed match**—"
-                "requires human review before any ITC action.",
-            ),
-            "low_confidence": (
-                "Low-Confidence Matches",
-                "Auto-detected below confidence threshold. **Requires human review**—"
-                "do not treat as certain.",
-            ),
-            "duplicate": (
-                "Duplicates",
-                "Duplicate purchase-register row (same GSTIN + invoice). May cause "
-                "double claiming.",
-            ),
-            "invalid": (
-                "Invalid Records",
-                "Row failed Phase 1 validation. Preserved for review; no ITC action "
-                "possible.",
-            ),
-            "unmatched_books": (
-                "Unmatched (Books)",
-                "No matching GSTR-2B invoice found. May affect ITC claim; requires "
-                "human review.",
-            ),
-            "unmatched_gstr2b": (
-                "Unmatched (GSTR-2B)",
-                "No matching purchase-register invoice (GSTR-2B only). No books-side "
-                "action required.",
-            ),
-        }
-
         cols = st.columns(2)
-        for idx, (status_key, (label, note)) in enumerate(status_labels.items()):
-            with cols[idx % 2]:
-                count = summary.get(status_key, 0)
-                st.markdown(f"**{label}** ({count})")
-                st.caption(note)
+        for index, status in enumerate(MatchStatus):
+            with cols[index % 2]:
+                count = (
+                    metrics.confirmed_matches
+                    if status == MatchStatus.EXACT
+                    else {
+                        MatchStatus.AMOUNT_MISMATCH: metrics.amount_mismatches,
+                        MatchStatus.TAX_HEAD_MISMATCH: metrics.tax_head_mismatches,
+                        MatchStatus.FUZZY: metrics.fuzzy_candidates,
+                        MatchStatus.PROBABLE: metrics.probable_candidates,
+                        MatchStatus.LOW_CONFIDENCE: metrics.low_confidence_candidates,
+                        MatchStatus.UNMATCHED_BOOKS: metrics.unmatched_books,
+                        MatchStatus.UNMATCHED_GSTR2B: metrics.unmatched_gstr2b,
+                        MatchStatus.DUPLICATE: metrics.duplicates,
+                        MatchStatus.INVALID: metrics.invalid_records,
+                    }[status]
+                )
+                st.markdown(f"**{_STATUS_LABELS[status]}** ({count})")
+                st.caption(_STATUS_NOTES[status])
+
+        st.markdown("#### Metric Definitions")
+        st.dataframe(
+            pd.DataFrame(_metric_definition_rows(metrics)),
+            width="stretch",
+            hide_index=True,
+        )
 
         st.markdown("#### Provisional Exposure Estimate")
         st.info(
             f"Sum of provisional exposure amounts across all decisions: "
-            f"₹{exposure_total.quantize(Decimal('0.01'))}. "
-            "This is a *provisional estimate only*—not a confirmed ITC impact. "
+            f"₹{metrics.provisional_exposure.quantize(Decimal('0.01'))}. "
+            "This is a *provisional estimate only* — not a confirmed ITC impact. "
             "GST rules require CA verification before being treated as reliable "
             "(rule R-CALC-TAX-EXPOSURE pending CA verification)."
         )
 
-        st.markdown("#### Uncertainty & Disclaimer")
         st.warning(
-            "- A match does **not** establish ITC eligibility. All eligibility statuses are "
-            "**UNCERTAIN** pending CA review of tax rules.\n"
+            "- A match does **not** establish ITC eligibility. All eligibility "
+            "statuses are **UNCERTAIN** pending CA review of tax rules.\n"
+            "- An exact match is only a *candidate* for an ITC claim and still "
+            "requires human review.\n"
             "- A discrepancy alone does **not** establish wrongdoing.\n"
-            "- All decision outputs are provisional and advisory. No automated filing, "
-            "payment holds, or vendor message sending is performed."
+            "- No automated filing, payment holds, or vendor message sending is "
+            "performed."
         )
 
     # ==================================================================
-    # TAB 2: EXCEPTIONS / WORKLIST
+    # Exceptions / worklist
     # ==================================================================
     with tab_exceptions:
         st.title("⚠️ Exception Worklist")
-
         st.markdown(
-            "Filter and inspect reconciliation exceptions. "
-            "Probable and low-confidence matches are never treated as confirmed. "
-            "Keep uncertain and invalid records visible for review."
+            "Every reconciliation row is listed below, including invalid and "
+            "unmatched records. Review-required rows are marked explicitly. "
+            "Probable and low-confidence matches are never treated as confirmed."
         )
 
-        # Build rows for the data table
-        rows = []
-        for m in result.matches:
-            book = m.purchase_record
-            gstr2b = m.gstr2b_record
+        df = _status_dataframe(result, decisions)
+        st.dataframe(df, width="stretch", height=420)
 
-            if book is not None:
-                gstin = book.gstin or ""
-                inv = book.invoice_number or ""
-                source = "books"
-                vendor = book.vendor_name or ""
-            else:
-                gstin = gstr2b.gstin or ""
-                inv = gstr2b.invoice_number or ""
-                source = "2b"
-                vendor = ""
-
-            rows.append({
-                "GSTIN": gstin,
-                "Invoice #": inv,
-                "Source": source,
-                "Vendor": vendor,
-                "Match Status": m.match_status.value,
-                "Confidence": f"{m.confidence:.2f}" if m.confidence else "N/A",
-                "Amount Difference": str(m.amount_difference) if m.amount_difference else "—",
-                "Tax Head Mismatch": "Yes" if m.tax_head_difference else "No",
-                "Discrepancies": "; ".join(m.discrepancies) if m.discrepancies else "—",
-                "Reason": m.reason,
-            })
-
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, height=500)
-
-        st.markdown("#### Filter by match status")
-        available_statuses = sorted(df["Match Status"].unique())
+        available_statuses = sorted(df["Match Status"].unique()) if not df.empty else []
         selected_statuses = st.multiselect(
-            "Show only",
+            "Filter by match status",
             available_statuses,
-            default=[s for s in available_statuses if s not in {"probable", "low_confidence"}],
+            default=available_statuses,
+            key="exception_status_filter",
         )
-        filtered_df = df[df["Match Status"].isin(selected_statuses)] if selected_statuses else df
-        st.dataframe(filtered_df, use_container_width=True, height=400)
+        if selected_statuses:
+            st.dataframe(
+                df[df["Match Status"].isin(selected_statuses)],
+                width="stretch",
+                height=360,
+            )
+        else:
+            st.info("No statuses selected.")
+
+        only_review = st.checkbox(
+            "Show only review-required rows",
+            value=False,
+            key="exception_review_only",
+        )
+        if only_review:
+            st.dataframe(
+                df[df["Review Required"] == "Yes"],
+                width="stretch",
+                height=360,
+            )
 
         st.caption(
-            "Note: 'probable' and 'low_confidence' matches are uncertain by design. "
             "A match does not establish ITC eligibility. All statuses map to "
-            "`eligibility_status = UNCERTAIN` pending CA verification."
+            "`eligibility_status = UNCERTAIN` (except GSTR-2B-only rows, which "
+            "are NOT_ASSESSED) pending CA verification."
         )
 
     # ==================================================================
-    # TAB 3: VENDOR MESSAGES
+    # Vendor messages
     # ==================================================================
     with tab_messages:
         st.title("📨 Vendor Message Drafts")
-
         st.markdown(
-            "Draft messages for vendors based on reconciliation findings. "
-            "Drafts are **deterministic templates**—they require human review and "
-            "editing before use. No emails or messages are sent automatically. "
-            "LLM enhancement is disabled by default; template fallback is used."
+            "Deterministic templates based on reconciliation findings. Drafts "
+            "require human review and editing. No emails or messages are sent "
+            "automatically. LLM enhancement is disabled by default."
         )
 
-        # Build drafts for all decisions that have a supported category
-        drafts_created: list = []
-
-        for d in decisions:
-            try:
-                category = _decision_to_category(d)
-                if category is None:
-                    continue
-                draft = draft_vendor_message(d, enhanced_by_llm=False)
-                drafts_created.append(draft)
-            except ValueError:
-                # Skip unsupported categories
-                continue
-
-        if not drafts_created:
-            st.info("No vendor drafts available for the current reconciliation results.")
+        drafts = st.session_state.get("_drafts", [])
+        if not drafts:
+            st.info("No vendor drafts available for the current results.")
         else:
-            st.write(f"Created {len(drafts_created)} draft(s). Each requires human review and editing.")
-            for draft in drafts_created:
+            st.write(
+                f"Created {len(drafts)} draft(s). Each requires human review and "
+                "editing before use."
+            )
+            for draft in drafts:
                 with st.expander(
-                    f"Category: {draft.category} | GSTIN: {draft.gstin or '—'} | "
-                    f"Invoice: {draft.invoice_number or '—'}"
+                    f"{draft.category} · GSTIN {draft.gstin or '—'} · "
+                    f"Invoice {draft.invoice_number or '—'}"
                 ):
                     st.markdown(f"**Subject:** {draft.subject}")
-                    st.markdown("**Email body:**")
                     st.text_area(
-                        f"email_{draft.draft_id}",
+                        "Email body",
                         draft.body_email,
-                        height=250,
+                        height=220,
                         key=f"email_{draft.draft_id}",
                     )
-                    st.markdown("**WhatsApp body:**")
                     st.text_area(
-                        f"whatsapp_{draft.draft_id}",
+                        "WhatsApp body",
                         draft.body_whatsapp,
-                        height=150,
+                        height=120,
                         key=f"whatsapp_{draft.draft_id}",
                     )
                     st.markdown(f"**Notes:** {draft.notes}")
                     st.caption(
-                        f"Draft ID: {draft.draft_id} | "
-                        f"Category: {draft.category} | "
-                        f"LLM Enhanced: {draft.llm_enhanced} (disabled by default) | "
-                        f"Editable: {draft.editable} — always edit before use."
+                        f"Draft ID: {draft.draft_id} · Template only · "
+                        "Editable · LLM enhanced: No"
                     )
 
-        st.markdown("#### Disclaimer")
         st.warning(
-            "- Drafts are **templates only** — they require human review and editing. "
-            "- No emails, WhatsApp messages, or other external communications are sent "
-            "automatically.\n"
-            "- LLM enhancement is opt-in and disabled by default. Template fallback is used. "
-            "- Drafts must not be sent without independent verification of invoice details. "
-            "- All drafts preserve the provisional, uncertain nature of the underlying "
-            "reconciliation."
+            "- Drafts are templates only and must be reviewed and edited.\n"
+            "- No external communication is sent.\n"
+            "- Drafts preserve the provisional, uncertain nature of the "
+            "underlying reconciliation."
         )
 
     # ==================================================================
-    # TAB 4: EXPORT & AUDIT
+    # Export & audit
     # ==================================================================
     with tab_export:
         st.title("📄 Export & Audit")
 
-        st.markdown(
-            "Download the Excel workbook and review the audit trail for the current run."
-        )
-
-        # --- Excel Export ---
         st.subheader("Excel Workbook Export")
-
-        if decisions:
-            export_path = f"data/runs/{st.session_state.run_id}/reconciliation.xlsx"
-
-            with st.spinner("📊 Generating Excel workbook…"):
-                try:
-                    export_result = export_workbook(
-                        export_path,
-                        decisions,
-                        drafts=None,
-                        review_records=st.session_state.review_records,
-                        audit_events=st.session_state.audit_log.read_events(),
-                        settings=DecisionSettings(),
-                    )
-                    st.success(f"Workbook exported: {export_result.path}")
-
-                    # Download button
-                    import base64
-                    with open(export_result.path, "rb") as f:
-                        wb_bytes = f.read()
-                    b64 = base64.b64encode(wb_bytes).decode()
-                    mime = (
-                        "application/vnd.openxmlformats-officedocument."
-                        "spreadsheetml.sheet"
-                    )
-                    st.download_button(
-                        label="▶️ Download Excel Workbook",
-                        data=wb_bytes,
-                        file_name="ITC_Sentinel_Reconciliation.xlsx",
-                        mime=mime,
-                    )
-
-                    # Sheet summary
-                    st.markdown("#### Workbook Sheets")
-                    for sheet_name in export_result.sheets:
-                        st.markdown(
-                            f"- **{sheet_name}** "
-                            f"({export_result.row_counts.get(sheet_name, 0)} data rows)"
-                        )
-
-                except Exception as e:
-                    st.error(f"Excel export failed: {e}")
-        else:
-            st.info("No decisions to export. Run reconciliation first.")
-
-        # --- Audit Log ---
-        st.subheader("🗂️ Audit Trail (Local Demo)")
-
-        if st.session_state.audit_log:
-            events = st.session_state.audit_log.read_events()
-            audit_rows = []
-            for e in events:
-                invoice_key_str = (
-                    f"{e.invoice_key}" if e.invoice_key else "-"
+        if st.button("Generate Excel workbook", key="generate_export"):
+            export_path = (
+                _runs_root()
+                / st.session_state.run_id
+                / "reconciliation.xlsx"
+            )
+            try:
+                export_result = export_workbook(
+                    str(export_path),
+                    decisions,
+                    drafts=st.session_state.get("_drafts", []),
+                    review_records=review_records,
+                    audit_events=st.session_state.audit_log.read_events(),
+                    settings=DecisionSettings(),
                 )
-                audit_rows.append({
-                    "Event ID": e.event_id[:8] + "...",
-                    "Timestamp": e.timestamp,
-                    "Event Type": e.event_type,
-                    "Run ID": e.run_id,
-                    "Invoice Key": invoice_key_str,
-                    "Summary": e.summary,
-                })
+                st.session_state._export_bytes = Path(export_result.path).read_bytes()
+                if not st.session_state.get("_export_audited", False):
+                    _record_event(
+                        AuditEventType.EXPORT_CREATED,
+                        f"Excel workbook exported with {len(export_result.sheets)} sheets",
+                        metadata={"sheets": ",".join(export_result.sheets)},
+                    )
+                    st.session_state._export_audited = True
+                st.success(f"Workbook generated: {export_result.path}")
+                st.caption(
+                    "Sheets: "
+                    + ", ".join(
+                        f"{name} ({export_result.row_counts.get(name, 0)} rows)"
+                        for name in export_result.sheets
+                    )
+                )
+            except Exception as exc:
+                st.error(f"Excel export failed: {exc}")
 
-            adf = pd.DataFrame(audit_rows)
-            st.dataframe(adf, use_container_width=True, height=400)
-
-            st.caption(
-                "The audit log is an append-only local JSONL file for demo purposes. "
-                "It is **not** tamper-proof or legally compliant storage. "
-                "No secrets or real taxpayer data are included."
+        export_bytes = st.session_state.get("_export_bytes")
+        if export_bytes:
+            st.download_button(
+                label="▶️ Download Excel workbook",
+                data=export_bytes,
+                file_name="ITC_Sentinel_Reconciliation.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                key="download_export",
             )
 
-        # --- Review Decision Recording ---
-        st.subheader("✏️ Record Review Decision")
+        st.subheader("🗂️ Audit Trail (Local Demo)")
+        try:
+            events = st.session_state.audit_log.read_events()
+        except (FileNotFoundError, ValueError) as exc:
+            events = []
+            st.warning(f"Audit log could not be read: {exc}")
 
-        st.markdown(
-            "Select a reconciliation record and record your human decision. "
-            "This preserves the original machine-generated result and adds your "
-            "review judgment with required identifiers."
+        if events:
+            audit_rows = [
+                {
+                    "Event ID": event.event_id[:8] + "…",
+                    "Timestamp": event.timestamp,
+                    "Event Type": event.event_type,
+                    "Run ID": event.run_id[:8] + "…",
+                    "Invoice Key": event.invoice_key or "—",
+                    "Summary": event.summary,
+                }
+                for event in events
+            ]
+            st.dataframe(
+                pd.DataFrame(audit_rows),
+                width="stretch",
+                height=300,
+            )
+        else:
+            st.info("No audit events recorded yet.")
+
+        st.caption(
+            "The audit log is an append-only local JSONL file for demo purposes. "
+            "It is not tamper-proof or legally compliant storage, and it contains "
+            "no uploaded file contents."
         )
 
-        if st.session_state.get("_reconciliation_result", None) is not None:
-            result = st.session_state._reconciliation_result
+        # --- Review decisions -----------------------------------------
+        st.subheader("✏️ Record Review Decision")
+        st.markdown(
+            "Only records whose decision sets `review_required=True` appear here. "
+            "The action list is controlled by the decision policy. Recording an "
+            "approval does not establish legal ITC eligibility."
+        )
 
-            # Build selector options from reviewable records
-            reviewable = []
-            for m in result.matches:
-                if m.match_status in {
-                    MatchStatus.UNMATCHED_BOOKS,
-                    MatchStatus.LOW_CONFIDENCE,
-                    MatchStatus.AMOUNT_MISMATCH,
-                    MatchStatus.TAX_HEAD_MISMATCH,
-                    MatchStatus.DUPLICATE,
-                    MatchStatus.INVALID,
-                }:
-                    gstin = ""
-                    inv = ""
-                    if m.purchase_record is not None:
-                        gstin = m.purchase_record.gstin or ""
-                        inv = m.purchase_record.invoice_number or ""
-                    elif m.gstr2b_record is not None:
-                        gstin = m.gstr2b_record.gstin or ""
-                        inv = m.gstr2b_record.invoice_number or ""
-                    reviewable.append((f"{gstin} | {inv}", m.match_status.value))
-
-            if reviewable:
-                # Use session state to persist selection
-                if "review_selector_idx" not in st.session_state:
-                    st.session_state.review_selector_idx = 0
-
-                # Find index safely
-                try:
-                    indices = [r[0] for r in reviewable]
-                    if st.session_state.review_selector_idx < len(indices):
-                        selected_idx = st.selectbox(
-                            "Select a record to review",
-                            range(len(reviewable)),
-                            format_func=lambda i: reviewable[i][0],
-                            index=min(st.session_state.review_selector_idx, len(indices) - 1),
-                            key="review_selector",
-                        )
-                    else:
-                        selected_idx = 0
-                        st.session_state.review_selector_idx = 0
-                except (ValueError, IndexError):
-                    selected_idx = 0
-
-                selected_key, selected_status = reviewable[selected_idx]
-                st.session_state.review_selector_idx = selected_idx
-
-                st.markdown(f"**Selected:** GSTIN {selected_key.split('|')[0]} | "
-                            f"Status: {selected_status}")
-
-                # Get the match result details
-                # Find the matching MatchResult
-                selected_match = None
-                for m in result.matches:
-                    book = m.purchase_record
-                    gstr2b = m.gstr2b_record
-                    check_gstin = book.gstin if book else (gstr2b.gstin if gstr2b else "")
-                    check_inv = book.invoice_number if book else (gstr2b.invoice_number if gstr2b else "")
-                    if f"{check_gstin}|{check_inv}" == selected_key:
-                        selected_match = m
-                        break
-
-                if selected_match is not None:
-                    with st.form(key="review_decision_form"):
-                        review_decision = st.radio(
-                            "Your decision:",
-                            options=["approve", "reject", "pending"],
-                            format_func=lambda x: {
-                                "approve": "✅ Approve",
-                                "reject": "❌ Reject",
-                                "pending": "⏳ Pending",
-                            }[x],
-                            key="decision_radio",
-                        )
-                        reviewer_reason = st.text_area(
-                            "Reviewer reason (optional)",
-                            help="Describe why you made this decision. This is recorded in the audit trail.",
-                        )
-                        reviewer_name = st.text_input(
-                            "Your name / identifier (optional)",
-                            help="For audit traceability. No secrets or real taxpayer data.",
-                        )
-
-                        submit_review = st.form_submit_button("💾 Record Decision")
-
-                        if submit_review:
-                            invoice_key_val = _invoice_key(
-                                selected_match.purchase_record.gstin if selected_match.purchase_record else None,
-                                selected_match.purchase_record.invoice_number if selected_match.purchase_record else (
-                                    selected_match.gstr2b_record.invoice_number if selected_match.gstr2b_record else None)
-                            )
-
-                            # Hmm, this is getting complicated. Let me simplify.
-                            # Actually, let me just use the gstin and invoice from the selected record.
-
-                            new_review = ReviewRecord(
-                                review_id=str(uuid.uuid4()),
-                                run_id=st.session_state.run_id,
-                                invoice_key=_invoice_key(
-                                    selected_match.purchase_record.gstin
-                                    if selected_match.purchase_record
-                                    else (
-                                        selected_match.gstr2b_record.gstin
-                                        if selected_match.gstr2b_record
-                                        else None
-                                    ),
-                                    selected_match.purchase_record.invoice_number
-                                    if selected_match.purchase_record
-                                    else (
-                                        selected_match.gstr2b_record.invoice_number
-                                        if selected_match.gstr2b_record
-                                        else None)
-                                ),
-                                match_status=selected_match.match_status.value,
-                                suggested_action=selected_match.match_status.value,
-                                decision=review_decision,
-                                reviewer_reason=reviewer_reason,
-                                reviewer_name=reviewer_name or "",
-                                timestamp=_utc_now_iso(),
-                                decision_metadata={},
-                            )
-
-                            # Append to audit log
-                            st.session_state.audit_log.append(
-                                AuditEvent(
-                                    event_id=str(uuid.uuid4()),
-                                    timestamp=_utc_now_iso(),
-                                    event_type=AuditEventType.REVIEW_ACTION,
-                                    run_id=st.session_state.run_id,
-                                    invoice_key=invoice_key_val,
-                                    summary=f"Review decision: {review_decision} for {selected_match.match_status.value}",
-                                    metadata={
-                                        "review_id": new_review.review_id,
-                                        "decision": review_decision,
-                                        "match_status": selected_match.match_status.value,
-                                    },
-                                )
-                            )
-
-                            # Store review record
-                            st.session_state.review_records.append(new_review)
-
-                            st.success(f"✅ Review decision recorded: {review_decision}")
-                            st.rerun()
-
-                else:
-                    st.info("Record selected but match details not found.")
-
-            # Display existing review records
-            if st.session_state.review_records:
-                st.markdown("#### Recorded Review Decisions")
-                review_rows = []
-                for rec in st.session_state.review_records:
-                    review_rows.append({
-                        "Review ID": rec.review_id[:8] + "...",
-                        "Run ID": rec.run_id[:8] + "...",
-                        "Invoice Key": rec.invoice_key or "-",
-                        "Match Status": rec.match_status,
-                        "Decision": rec.decision,
-                        "Reviewer Reason": (
-                            rec.reviewer_reason[:60] + "..." if len(rec.reviewer_reason) > 60
-                            else rec.reviewer_reason
-                        ),
-                        "Reviewer": rec.reviewer_name or "—",
-                        "Timestamp": rec.timestamp,
-                    })
-
-                rdf = pd.DataFrame(review_rows)
-                st.dataframe(rdf, use_container_width=True, height=300)
-
-                st.caption(
-                    "Review decisions are preserved across reruns for this session. "
-                    "Each run has its own run_id and audit log file in "
-                    "data/runs/<run_id>/. Closing the browser resets the session state."
-                )
-            else:
-                st.info("No review decisions recorded yet.")
+        worklist = [d for d in decisions if d.review_required]
+        if not worklist:
+            st.info("No records currently require review.")
         else:
-            st.info("Run reconciliation first to enable review recording.")
+            decision_by_id = {
+                record_identity(d.match_result): d for d in worklist
+            }
+            options = list(decision_by_id)
+
+            selected_id = st.selectbox(
+                "Select a record to review",
+                options,
+                format_func=lambda record_id: _display_label(
+                    decision_by_id[record_id]
+                ),
+                key="review_record_selector",
+            )
+            selected = decision_by_id[selected_id]
+            match = selected.match_result
+            book = match.purchase_record
+            gstr2b = match.gstr2b_record
+
+            st.markdown(
+                f"**Record {selected_id}** · "
+                f"Status: `{match.match_status.value}` · "
+                f"Suggested action: `{selected.action.value}` · "
+                f"Eligibility: `{selected.eligibility_status.value}`"
+            )
+            st.caption(match.reason)
+
+            evidence_col1, evidence_col2 = st.columns(2)
+            with evidence_col1:
+                st.markdown("**Purchase register**")
+                if book is None:
+                    st.write("— (GSTR-2B only record)")
+                else:
+                    st.write(
+                        {
+                            "gstin": book.gstin,
+                            "invoice": book.invoice_number,
+                            "date": str(book.invoice_date) if book.invoice_date else None,
+                            "taxable_value": str(book.taxable_value)
+                            if book.taxable_value is not None
+                            else None,
+                            "cgst": str(book.cgst) if book.cgst is not None else None,
+                            "sgst": str(book.sgst) if book.sgst is not None else None,
+                            "igst": str(book.igst) if book.igst is not None else None,
+                            "cess": str(book.cess) if book.cess is not None else None,
+                        }
+                    )
+            with evidence_col2:
+                st.markdown("**GSTR-2B**")
+                if gstr2b is None:
+                    st.write("— (no GSTR-2B counterpart)")
+                else:
+                    st.write(
+                        {
+                            "gstin": gstr2b.gstin,
+                            "invoice": gstr2b.invoice_number,
+                            "date": str(gstr2b.invoice_date)
+                            if gstr2b.invoice_date
+                            else None,
+                            "taxable_value": str(gstr2b.taxable_value)
+                            if gstr2b.taxable_value is not None
+                            else None,
+                            "cgst": str(gstr2b.cgst)
+                            if gstr2b.cgst is not None
+                            else None,
+                            "sgst": str(gstr2b.sgst)
+                            if gstr2b.sgst is not None
+                            else None,
+                            "igst": str(gstr2b.igst)
+                            if gstr2b.igst is not None
+                            else None,
+                            "cess": str(gstr2b.cess)
+                            if gstr2b.cess is not None
+                            else None,
+                        }
+                    )
+
+            if match.discrepancies:
+                st.markdown(
+                    "**Discrepancies:** " + ", ".join(match.discrepancies)
+                )
+            if match.amount_difference is not None:
+                st.markdown(
+                    f"**Amount difference (books − 2B):** "
+                    f"{match.amount_difference}"
+                )
+
+            previous_state = _latest_state_for(review_records, selected)
+            if previous_state != "none":
+                st.info(f"Current review state for this record: `{previous_state}`")
+            else:
+                st.caption("This record has not been reviewed yet.")
+
+            permitted = allowed_review_decisions(selected)
+            action_labels = {
+                "approve": "✅ Approve",
+                "reject": "❌ Reject",
+                "pending": "⏳ Pending",
+            }
+
+            with st.form(key=f"review_form_{selected_id}"):
+                review_decision = st.radio(
+                    "Your decision",
+                    options=list(permitted),
+                    format_func=lambda value: action_labels[value],
+                    key=f"decision_radio_{selected_id}",
+                )
+                reviewer_reason = st.text_area(
+                    "Reviewer reason (optional)",
+                    help="Recorded in the audit trail. Do not include secrets.",
+                    key=f"reason_{selected_id}",
+                )
+                reviewer_name = st.text_input(
+                    "Your name / identifier (optional)",
+                    help="For audit traceability. Do not include secrets.",
+                    key=f"reviewer_{selected_id}",
+                )
+                submitted = st.form_submit_button(
+                    "💾 Record decision", key=f"submit_review_{selected_id}"
+                )
+
+            if submitted:
+                try:
+                    normalized = validate_review_decision(
+                        selected, review_decision
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    invoice_key = _record_to_invoice_key(match)
+                    review = ReviewRecord(
+                        review_id=str(uuid.uuid4()),
+                        run_id=st.session_state.run_id,
+                        invoice_key=invoice_key,
+                        match_status=match.match_status.value,
+                        suggested_action=selected.action.value,
+                        decision=normalized,
+                        reviewer_reason=reviewer_reason,
+                        reviewer_name=reviewer_name,
+                        timestamp=_utc_now_iso(),
+                        decision_metadata={
+                            "record_id": selected_id,
+                            "eligibility_status": selected.eligibility_status.value,
+                            "priority": selected.priority.value,
+                            "flags": [flag.value for flag in selected.flags],
+                        },
+                        record_id=selected_id,
+                        previous_state=previous_state,
+                        new_state=normalized,
+                    )
+                    st.session_state.review_records.append(review)
+                    _record_event(
+                        AuditEventType.REVIEW_ACTION,
+                        (
+                            f"Review decision '{normalized}' for "
+                            f"{match.match_status.value} record {selected_id} "
+                            f"(previous: {previous_state})"
+                        ),
+                        invoice_key=invoice_key,
+                        metadata={
+                            "review_id": review.review_id,
+                            "record_id": selected_id,
+                            "decision": normalized,
+                            "previous_state": previous_state,
+                            "new_state": normalized,
+                            "match_status": match.match_status.value,
+                        },
+                    )
+                    st.success(
+                        f"Review decision recorded: {normalized}. It is an "
+                        "operational review outcome, not a legal eligibility "
+                        "determination."
+                    )
+                    st.rerun()
+
+        st.markdown("#### Recorded Review Decisions")
+        if review_records:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Review ID": rec.review_id[:8] + "…",
+                            "Record ID": rec.record_id or "—",
+                            "Invoice Key": rec.invoice_key or "—",
+                            "Match Status": rec.match_status,
+                            "Suggested Action": rec.suggested_action,
+                            "Previous": rec.previous_state or "none",
+                            "New": rec.new_state or rec.decision,
+                            "Reviewer": rec.reviewer_name or "—",
+                            "Reason": rec.reviewer_reason,
+                            "Timestamp": rec.timestamp,
+                        }
+                        for rec in review_records
+                    ]
+                ),
+                width="stretch",
+                height=260,
+            )
+        else:
+            st.info("No review decisions recorded for this run.")
+
+        st.caption(
+            "Reviews are scoped to this run. Each reconciliation request rotates "
+            "the run ID and audit log, so data from different runs is not mixed. "
+            "Closing the browser resets session state."
+        )
 
 
 # ---------------------------------------------------------------------------
-# Footer / sidebar note
+# Footer
 # ---------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    f"Iteration: {__version__} | "
-    "Phase 5: Streamlit MVP | "
-    "No Phase 6 work started"
+    f"ITC Sentinel v{__version__} · Synthetic-data MVP · "
+    "Decision support only — not a GST filing system"
 )

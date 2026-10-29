@@ -17,8 +17,10 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from zipfile import BadZipFile
 
 from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 from .schemas import (
     GSTR2B_INVOICE_FIELDS,
@@ -130,24 +132,32 @@ def _read_csv(path: str) -> tuple[list[str], list[dict[str, str]]]:
 
 def _read_xlsx(path: str) -> tuple[list[str], list[dict[str, str]]]:
     """Read the first sheet of an XLSX file into header + list of dicts."""
-    workbook = load_workbook(path, read_only=True, data_only=True)
-    sheet = workbook.active
-    rows = sheet.iter_rows(values_only=True)
     try:
-        first_row = next(rows)
-    except StopIteration:
-        raise IngestionError(f"XLSX file has no data: {path}") from None
-    header = [
-        str(cell).strip() if cell is not None else "" for cell in first_row
-    ]
-    records: list[dict[str, str]] = []
-    for row in rows:
-        record: dict[str, str] = {}
-        for index, cell in enumerate(row):
-            key = header[index] if index < len(header) else f"col_{index}"
-            record[key] = _clean_cell(cell)
-        records.append(record)
-    return header, records
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    except (BadZipFile, InvalidFileException, OSError, KeyError, ValueError) as exc:
+        raise IngestionError(
+            f"Invalid or unreadable XLSX file {path}: {exc}"
+        ) from exc
+    try:
+        sheet = workbook.active
+        rows = sheet.iter_rows(values_only=True)
+        try:
+            first_row = next(rows)
+        except StopIteration:
+            raise IngestionError(f"XLSX file has no data: {path}") from None
+        header = [
+            str(cell).strip() if cell is not None else "" for cell in first_row
+        ]
+        records: list[dict[str, str]] = []
+        for row in rows:
+            record: dict[str, str] = {}
+            for index, cell in enumerate(row):
+                key = header[index] if index < len(header) else f"col_{index}"
+                record[key] = _clean_cell(cell)
+            records.append(record)
+        return header, records
+    finally:
+        workbook.close()
 
 
 def load_purchase_register(path: str) -> IngestResult:

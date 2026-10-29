@@ -15,10 +15,10 @@
 **Dependencies:** none.
 
 **Completion checklist**
-- [ ] Six root Markdown files exist and agree with each other.
-- [ ] Environment setup works on a clean machine.
-- [ ] No secrets or real taxpayer data are tracked.
-- [ ] Scope and tax assumptions are explicitly documented.
+- [x] Six root Markdown files exist and agree with each other.
+- [x] Environment setup works on a clean machine. *(verified in a fresh isolated venv on 2026-10-29: install, 215 tests, Ruff, verifier, and Streamlit health check)*
+- [x] No secrets or real taxpayer data are tracked.
+- [x] Scope and tax assumptions are explicitly documented.
 
 ## Phase 1 — Input ingestion and normalization
 **Objective:** Load supported files safely and produce canonical rows.
@@ -34,10 +34,10 @@
 **Dependencies:** Phase 0.
 
 **Completion checklist**
-- [ ] Valid CSV/XLSX/JSON fixtures load.
-- [ ] Missing columns and malformed files produce useful errors.
-- [ ] Invalid rows are not silently discarded.
-- [ ] Normalization and monetary rounding tests pass.
+- [x] Valid CSV/XLSX/JSON fixtures load.
+- [x] Missing columns and malformed files produce useful errors.
+- [x] Invalid rows are not silently discarded.
+- [x] Normalization and monetary rounding tests pass.
 
 ## Phase 2 — Deterministic reconciliation
 **Objective:** Match purchase-register and GSTR-2B invoices transparently.
@@ -54,10 +54,10 @@
 **Dependencies:** Phase 1.
 
 **Completion checklist**
-- [ ] Every matching stage has focused unit tests.
-- [ ] No invoice is used in more than one pair.
-- [ ] Matching is constrained to the same normalized GSTIN.
-- [ ] Precision/recall and error cases are measured and reported.
+- [x] Every matching stage has focused unit tests.
+- [x] No invoice is used in more than one pair.
+- [x] Matching is constrained to the same normalized GSTIN.
+- [x] Precision/recall and error cases are measured and reported.
 
 ## Phase 3 — Rule engine and decision support
 **Objective:** Calculate risk flags and explainable suggested actions.
@@ -73,10 +73,15 @@
 **Dependencies:** Phase 2.
 
 **Completion checklist**
-- [ ] Every decision rule has a test and stable reason code.
-- [ ] Tax calculations use a documented money/rounding policy.
-- [ ] Unverified legal assumptions are visibly labelled.
-- [ ] No LLM output can change amounts or decisions.
+- [x] Every decision rule has a test and stable reason code.
+- [x] Tax calculations use a documented money/rounding policy.
+- [x] Unverified legal assumptions are visibly labelled.
+- [x] No LLM output can change amounts or decisions.
+
+> **External condition:** CA verification of tax-sensitive rules (task P3-01) has
+> not been performed. All rules remain `ca_verification_required=True` and every
+> eligibility status remains `UNCERTAIN`. This does not block a synthetic-data
+> demo, but blocks reliance on outputs for real filings.
 
 ## Phase 4 — Review workflow, messages, exports, and audit
 **Objective:** Let a reviewer act on the worklist and preserve evidence.
@@ -92,11 +97,11 @@
 **Dependencies:** Phase 3.
 
 **Completion checklist**
-- [ ] Review actions are recorded with run and invoice identifiers.
-- [ ] Drafts can be used without an LLM key.
-- [ ] LLM failures safely fall back to templates.
-- [ ] Exports preserve data and protect text cells from formula injection.
-- [ ] Audit is described honestly as local demo logging, not tamper-proof storage.
+- [x] Review actions are recorded with run and invoice identifiers.
+- [x] Drafts can be used without an LLM key.
+- [x] LLM failures safely fall back to templates.
+- [x] Exports preserve data and protect text cells from formula injection.
+- [x] Audit is described honestly as local demo logging, not tamper-proof storage.
 
 ## Phase 5 — Streamlit MVP
 **Objective:** Provide the complete end-to-end user workflow.
@@ -112,11 +117,11 @@
 **Dependencies:** Phases 1–4.
 
 **Completion checklist**
-- [ ] A new user can complete the full workflow without developer intervention.
-- [ ] Pipeline runs only when explicitly requested.
-- [ ] Review status is reflected in the UI and audit history.
-- [ ] UI labels uncertainty and does not rely on color alone.
-- [ ] End-to-end smoke test passes.
+- [x] A new user can complete the full workflow without developer intervention.
+- [x] Pipeline runs only when explicitly requested.
+- [x] Review status is reflected in the UI and audit history.
+- [x] UI labels uncertainty and does not rely on color alone.
+- [x] End-to-end smoke test passes.
 
 ## Phase 6 — Verification and demo readiness
 **Objective:** Validate quality, reproducibility, and safe presentation.
@@ -132,11 +137,16 @@
 **Dependencies:** Phase 5.
 
 **Completion checklist**
-- [ ] Full test suite and Ruff pass.
-- [ ] Fresh local setup instructions have been tested.
-- [ ] No real taxpayer data or secrets are in the repository.
-- [ ] GST-rule limitations and CA-review requirement are disclosed.
-- [ ] Demo can be repeated from a clean start.
+- [x] Full test suite and Ruff pass. *(215 passed; `ruff check .` clean)*
+- [x] Fresh local setup instructions have been tested. *(fresh isolated venv: `pip install -r requirements.txt` exit 0; 215 tests, Ruff, verifier, and Streamlit health check all pass)*
+- [x] No real taxpayer data or secrets are in the repository. *(accidentally committed pytest temp artifacts removed)*
+- [x] GST-rule limitations and CA-review requirement are disclosed.
+- [x] Demo can be repeated from a clean start. *(`python scripts/verify_pipeline.py`: 20/20 checks)*
+
+> **Completion status:** Phase 6 is complete for the synthetic-data MVP demo.
+> The only open validation is the external CA review from Phase 3 (P3-01);
+> environment reproducibility, tests, lint, verifier, and live startup are
+> verified.
 
 ## Post-MVP backlog (not part of initial phases)
 - Persistent database and multi-client support.

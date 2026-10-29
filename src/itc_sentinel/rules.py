@@ -23,7 +23,7 @@ Public functions:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from .schemas import MONEY_PLACES, NormalizedRecord
 
@@ -234,7 +234,7 @@ def calculate_amount_difference(
     if book.taxable_value is None or gstr2b.taxable_value is None:
         return None
     return (book.taxable_value - gstr2b.taxable_value).quantize(
-        settings.money_places
+        settings.money_places, rounding=ROUND_HALF_UP
     )
 
 
@@ -257,7 +257,7 @@ def calculate_tax_exposure(
     for r in records:
         if r.total_tax is not None:
             total += r.total_tax
-    return total.quantize(settings.money_places)
+    return total.quantize(settings.money_places, rounding=ROUND_HALF_UP)
 
 
 def calculate_taxable_exposure(
@@ -279,4 +279,4 @@ def calculate_taxable_exposure(
     for r in records:
         if r.taxable_value is not None:
             total += r.taxable_value
-    return total.quantize(settings.money_places)
+    return total.quantize(settings.money_places, rounding=ROUND_HALF_UP)

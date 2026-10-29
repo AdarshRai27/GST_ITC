@@ -39,6 +39,7 @@ from .decision import (
     Priority,
     total_exposure,
 )
+from .matcher import MatchStatus, record_identity
 from .messages import VendorDraft
 from .rules import MONEY_PLACES, RuleSettings
 
@@ -85,7 +86,10 @@ def safe_cell_value(value: Any) -> Any:
         A safe cell value.
     """
     if isinstance(value, str):
-        if value and value[0] in _FORMULA_PREFIXES:
+        # Check the first non-whitespace character too: some spreadsheet
+        # importers trim leading spaces before interpreting a formula.
+        candidate = value.lstrip()
+        if candidate and candidate[0] in _FORMULA_PREFIXES:
             return "'" + value
     return value
 
@@ -161,9 +165,18 @@ def _build_summary_sheet(ws, decisions: list[DecisionResult],
     high_count = sum(1 for d in decisions if d.priority == Priority.HIGH)
     medium_count = sum(1 for d in decisions if d.priority == Priority.MEDIUM)
     low_count = sum(1 for d in decisions if d.priority == Priority.LOW)
+    exact_count = status_counts.get(MatchStatus.EXACT, 0)
+    mismatch_count = status_counts.get(MatchStatus.AMOUNT_MISMATCH, 0) + status_counts.get(
+        MatchStatus.TAX_HEAD_MISMATCH, 0
+    )
 
     rows = [
         ("Total reconciliation rows", len(decisions), ""),
+        ("Confirmed matches (exact only)", exact_count,
+         "Amount mismatches, tax-head mismatches, fuzzy, probable, duplicate, "
+         "invalid, and unmatched rows are NOT confirmed matches"),
+        ("Amount + tax-head mismatches", mismatch_count,
+         "Discrepancies requiring clarification; never counted as confirmed"),
         ("Review required", review_required_count,
          "Human review required for uncertain or high-risk records"),
         ("High priority", high_count,
@@ -189,8 +202,8 @@ def _build_summary_sheet(ws, decisions: list[DecisionResult],
     r += 1
     _write_header(ws, ["Status", "Count", "Notes"])
     r += 1
-    for status in sorted(status_counts, key=lambda s: str(s)):
-        _write_row(ws, r, [str(status), status_counts[status], ""])
+    for status in sorted(status_counts, key=lambda s: s.value):
+        _write_row(ws, r, [status.value, status_counts[status], ""])
         r += 1
 
     _autofit(ws)
@@ -200,7 +213,7 @@ def _build_summary_sheet(ws, decisions: list[DecisionResult],
 def _build_reconciliation_sheet(ws, decisions: list[DecisionResult]) -> int:
     """Write the Reconciliation sheet. Returns data-row count."""
     headers = [
-        "source_type", "source_file", "source_row", "gstin",
+        "record_id", "source_type", "source_file", "source_row", "gstin",
         "invoice_number", "invoice_date", "match_status", "confidence",
         "amount_difference", "tax_head_difference", "discrepancies",
         "reason",
@@ -220,6 +233,7 @@ def _build_reconciliation_sheet(ws, decisions: list[DecisionResult]) -> int:
         source_file = getattr(record, "source_file", "") if record is not None else ""
         source_row = getattr(record, "source_row", "") if record is not None else ""
         _write_row(ws, r, [
+            record_identity(m),
             source_type,
             source_file,
             source_row,
@@ -241,7 +255,7 @@ def _build_reconciliation_sheet(ws, decisions: list[DecisionResult]) -> int:
 def _build_decisions_sheet(ws, decisions: list[DecisionResult]) -> int:
     """Write the Decisions sheet. Returns data-row count."""
     headers = [
-        "source_type", "source_file", "source_row", "gstin",
+        "record_id", "source_type", "source_file", "source_row", "gstin",
         "invoice_number", "action", "priority", "flags", "reason_code",
         "reason", "exposure_amount", "review_required",
         "eligibility_status",
@@ -261,6 +275,7 @@ def _build_decisions_sheet(ws, decisions: list[DecisionResult]) -> int:
         source_file = getattr(record, "source_file", "") if record is not None else ""
         source_row = getattr(record, "source_row", "") if record is not None else ""
         _write_row(ws, r, [
+            record_identity(m),
             source_type,
             source_file,
             source_row,
@@ -313,9 +328,9 @@ def _build_drafts_sheet(ws, drafts: list[VendorDraft]) -> int:
 def _build_review_sheet(ws, review_records: list[ReviewRecord]) -> int:
     """Write the Review sheet. Returns data-row count."""
     headers = [
-        "review_id", "run_id", "invoice_key", "match_status",
-        "suggested_action", "decision", "reviewer_reason", "reviewer_name",
-        "timestamp",
+        "review_id", "run_id", "record_id", "invoice_key", "match_status",
+        "suggested_action", "decision", "previous_state", "new_state",
+        "reviewer_reason", "reviewer_name", "timestamp",
     ]
     _write_header(ws, headers)
 
@@ -324,10 +339,13 @@ def _build_review_sheet(ws, review_records: list[ReviewRecord]) -> int:
         _write_row(ws, r, [
             rec.review_id,
             rec.run_id,
+            rec.record_id,
             rec.invoice_key,
             rec.match_status,
             rec.suggested_action,
             rec.decision,
+            rec.previous_state,
+            rec.new_state,
             rec.reviewer_reason,
             rec.reviewer_name,
             rec.timestamp,

@@ -23,7 +23,7 @@ Public functions:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from typing import Any
 
@@ -39,14 +39,22 @@ __all__ = [
     "Flag",
     "Priority",
     "ReasonCode",
+    "REVIEW_DECISIONS",
+    "allowed_review_decisions",
     "decide",
+    "validate_review_decision",
 ]
 
 
 class Action(str, Enum):
-    """Suggested operational action (advisory only; nothing is executed)."""
+    """Suggested operational action (advisory only; nothing is executed).
 
-    CLAIM_ITC = "claim_itc"
+    ``PROPOSE_ITC_CLAIM`` deliberately avoids implying that a claim has been
+    approved. A matching invoice is only a *candidate* for an ITC claim until
+    eligibility is established and a human has reviewed it.
+    """
+
+    PROPOSE_ITC_CLAIM = "propose_itc_claim"
     REQUEST_CLARIFICATION = "request_clarification"
     FLAG_FOR_REVIEW = "flag_for_review"
     EXCLUDE_FROM_ITC = "exclude_from_itc"
@@ -158,17 +166,18 @@ class DecisionResult:
 def _decide_exact(match: MatchResult, settings: DecisionSettings) -> DecisionResult:
     return DecisionResult(
         match_result=match,
-        action=Action.CLAIM_ITC,
+        action=Action.PROPOSE_ITC_CLAIM,
         priority=Priority.LOW,
         flags=[],
         reason=(
-            "Exact match on GSTIN, invoice number, date, and amounts. "
-            "ITC claim is provisional: matching is not proof of eligibility "
+            "Exact match on GSTIN, invoice number, date, and amounts. This is "
+            "a candidate for an ITC claim only. Matching is not proof of "
+            "eligibility, so human review is still required before any claim "
             "(rule R-ITC-ELIGIBILITY)."
         ),
         reason_code=ReasonCode.EXACT_MATCH,
         exposure_amount=Decimal("0"),
-        review_required=False,
+        review_required=True,
         eligibility_status=EligibilityStatus.UNCERTAIN,
         rule_sources_applied=["R-MATCH-EXACT", "R-ITC-ELIGIBILITY"],
     )
@@ -400,6 +409,69 @@ def _priority_for_exposure(
 
 
 # ---------------------------------------------------------------------------
+# Human-review action policy
+# ---------------------------------------------------------------------------
+
+# The complete set of review decisions supported by the MVP.
+REVIEW_DECISIONS: tuple[str, ...] = ("approve", "reject", "pending")
+
+# Invalid rows cannot be approved: there is nothing valid to approve until the
+# underlying data is corrected. They may still be rejected or left pending.
+_STATUSES_WITHOUT_APPROVAL = frozenset({MatchStatus.INVALID})
+
+
+def allowed_review_decisions(decision: DecisionResult) -> tuple[str, ...]:
+    """Return the review decisions permitted for *decision*.
+
+    The policy lives here, in the decision layer, so the UI cannot invent its
+    own rules. Invalid rows may not be approved; every other reviewable row
+    supports approve, reject, and pending.
+    """
+    if decision.match_result.match_status in _STATUSES_WITHOUT_APPROVAL:
+        return tuple(d for d in REVIEW_DECISIONS if d != "approve")
+    return REVIEW_DECISIONS
+
+
+def validate_review_decision(
+    decision: DecisionResult,
+    review_decision: str,
+) -> str:
+    """Validate and normalise a human review decision.
+
+    Returns the normalised decision string (``"approve"``, ``"reject"`` or
+    ``"pending"``).
+
+    Raises:
+        ValueError: If the record does not require review, the decision is
+            unknown, or the decision is not permitted for this record's
+            status.
+    """
+    if not decision.review_required:
+        raise ValueError(
+            "This record does not require human review under the current "
+            "decision policy."
+        )
+    if not isinstance(review_decision, str):
+        raise ValueError("Review decision must be a string.")
+
+    normalized = review_decision.strip().lower()
+    if normalized not in REVIEW_DECISIONS:
+        raise ValueError(
+            f"Unknown review decision {review_decision!r}; expected one of "
+            f"{', '.join(REVIEW_DECISIONS)}."
+        )
+
+    allowed = allowed_review_decisions(decision)
+    if normalized not in allowed:
+        raise ValueError(
+            f"Review decision {normalized!r} is not permitted for match "
+            f"status {decision.match_result.match_status.value!r}; allowed: "
+            f"{', '.join(allowed)}."
+        )
+    return normalized
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -479,4 +551,4 @@ def total_exposure(decisions: list[DecisionResult]) -> Decimal:
     for d in decisions:
         if d.exposure_amount is not None:
             total += d.exposure_amount
-    return total.quantize(MONEY_PLACES)
+    return total.quantize(MONEY_PLACES, rounding=ROUND_HALF_UP)

@@ -13,9 +13,11 @@ from decimal import Decimal
 
 from itc_sentinel.ingest import load_gstr2b_json, load_purchase_register
 from itc_sentinel.matcher import (
+    MatchResult,
     MatchStatus,
     ReconciliationSettings,
     reconcile,
+    record_identity,
 )
 from itc_sentinel.normalize import (
     normalize_amount,
@@ -633,6 +635,82 @@ def test_amount_difference_populated_on_mismatch():
             assert m.amount_difference == Decimal("200.00")
 
 
+def test_record_ids_are_unique_and_duplicate_aware():
+    """Every reconciliation result has a stable, unique internal identity.
+
+    Duplicate rows share GSTIN+invoice, so the identity must come from the
+    source row, not from the display invoice key.
+    """
+    books, gstr2b = _load_normalized()
+    result = reconcile(books, gstr2b)
+
+    ids = [record_identity(m) for m in result.matches]
+    assert len(ids) == len(set(ids))
+
+    book_rows = {
+        m.purchase_record.source_row: record_identity(m)
+        for m in result.matches
+        if m.purchase_record is not None
+    }
+    # Row 0 (matched) and row 5 (duplicate) share GSTIN+invoice but must not
+    # share an identity.
+    assert book_rows[0] == "books:0"
+    assert book_rows[5] == "books:5"
+    assert book_rows[0] != book_rows[5]
+
+
+def test_record_identity_fallback_for_hand_built_match():
+    match = MatchResult(
+        purchase_record=_make_record(3, "29ABCDE1234F1Z5", "INV-3"),
+        gstr2b_record=None,
+        match_status=MatchStatus.UNMATCHED_BOOKS,
+        confidence=0.0,
+        reason="test",
+    )
+    assert record_identity(match) == "books:3"
+
+
+def test_fuzzy_threshold_is_enforced():
+    """A same-core pair below fuzzy_threshold must not be labelled FUZZY.
+
+    "INV1" and "I-N-V-1" share the core "INV1" but score ~72.7, below the
+    default fuzzy threshold of 85. They remain eligible for the probable bucket.
+    """
+    books = [_make_record(0, "29ABCDE1234F1Z5", "INV1")]
+    gstr2b = [
+        _make_record(
+            0, "29ABCDE1234F1Z5", "I-N-V-1", source_type=SourceType.GSTR_2B
+        ),
+    ]
+
+    default_result = reconcile(books, gstr2b)
+    assert _book_statuses(default_result)[0] == MatchStatus.PROBABLE
+
+    permissive = ReconciliationSettings(fuzzy_threshold=70.0)
+    permissive_result = reconcile(books, gstr2b, settings=permissive)
+    assert _book_statuses(permissive_result)[0] == MatchStatus.FUZZY
+
+
+def test_fuzzy_threshold_boundary_at_or_above():
+    """A same-core pair at/above the fuzzy threshold is FUZZY."""
+    books = [_make_record(0, "29ABCDE1234F1Z5", "INV-3001")]
+    gstr2b = [
+        _make_record(
+            0, "29ABCDE1234F1Z5", "INV 3001", source_type=SourceType.GSTR_2B
+        ),
+    ]
+    # rapidfuzz similarity is 87.5: below 87.5 -> probable, at 87.5 -> fuzzy.
+    below = reconcile(
+        books, gstr2b, settings=ReconciliationSettings(fuzzy_threshold=87.6)
+    )
+    assert _book_statuses(below)[0] == MatchStatus.PROBABLE
+
+    at_or_above = reconcile(
+        books, gstr2b, settings=ReconciliationSettings(fuzzy_threshold=87.5)
+    )
+    assert _book_statuses(at_or_above)[0] == MatchStatus.FUZZY
+
+
 def test_date_discrepancy_recorded():
     """A differing invoice date is listed in discrepancies."""
     books = [
@@ -650,3 +728,7 @@ def test_date_discrepancy_recorded():
     assert (0, 0) in pairs and pairs[(0, 0)] == MatchStatus.AMOUNT_MISMATCH
     for m in result.matched_pairs:
         assert "invoice_date" in m.discrepancies
+        # The reason must describe the actual differing field, not claim that
+        # monetary values differ when only the date does.
+        assert "invoice_date" in m.reason
+        assert "monetary values differ" not in m.reason

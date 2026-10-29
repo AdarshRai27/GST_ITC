@@ -1,198 +1,128 @@
 # Phase 6 — Demo Readiness Report
 
-**Report Date:** 2026-10-22  
-**Phase:** 6 — Verification and Demo Readiness  
-**Overall Verdict:** **DEMO READY** — All mandatory acceptance criteria pass. Production readiness not claimed.
+**Report date:** 2026-10-29 (supersedes the 2026-10-22 draft)
+**Phase:** 6 — Verification and demo readiness
+**Overall verdict:** **READY WITH DOCUMENTED CONDITIONS** for an authorized
+synthetic-data demonstration. Production readiness not claimed.
+**Detailed verdict:** see `audit/deployment_readiness.md`.
 
 ---
 
-## 1. Executive Summary
+## 1. Executive summary
 
-ITC Sentinel Phase 5 (Streamlit MVP) is complete and verified. Phase 6 verification confirms:
+The Streamlit MVP and deterministic pipeline are complete and re-verified after
+defect remediation:
 
-- All 152 unit tests pass with exit code 0
-- Ruff linting passes with exit code 0
-- End-to-end pipeline works with synthetic data from upload to Excel export
-- Matching precision = 1.0, Recall = 1.0 against ground truth
-- All eligibility statuses are explicitly `UNCERTAIN` or `NOT_ASSESSED` (provisional)
-- No real taxpayer data in the repository
-- LLM enhancement disabled by default; cannot change numeric values or decisions
-- Audit log is local demo trail (not tamper-proof)
-- Excel exports have formula-injection protection
-- Full end-to-end workflow: file upload → reconciliation → exception review → vendor drafts → export
+- **215 tests pass** (exit 0), including 21 Streamlit `AppTest` workflow cases.
+- `ruff check .` is clean (exit 0).
+- `python scripts/verify_pipeline.py` passes **20/20** ground-truth checks.
+- A real Streamlit server returns `200 ok` on `/_stcore/health` (root `200`).
+- Matching precision = recall = 1.0 against the synthetic ground truth.
+- Confirmed matches = exact matches only (2 on the sample); mismatches, fuzzy,
+  probable, duplicate, invalid, and unmatched rows are separate KPIs.
+- Exact matches are **candidates** (`PROPOSE_ITC_CLAIM`) with mandatory review;
+  eligibility remains `UNCERTAIN`.
+- Invalid rows cannot be approved; policy is enforced in `decision.py`.
+- Uploads are size/type checked, path-traversal safe, and deleted after ingestion.
+- No real taxpayer data or secrets are present; `.env` is git-ignored.
+- LLM enhancement is opt-in and disabled by default.
+- Audit logging and Excel formula-injection protection are verified.
 
-**Demo is repeatable from a clean start** using: `python -m venv .venv .venv\Scripts\Activate.ps1 | pip install -r requirements.txt | streamlit run app.py`
-
-**Production readiness is not claimed.** See Section 5 for full limitations disclosure.
+**Not production-ready.** See `audit/deployment_readiness.md` for conditions
+(CA validation, GSTR-2B schema assumption, demo-grade audit, single-user
+session state).
 
 ---
 
-## 2. Phase 6 Acceptance-Criteria Checklist (`phases.md:134-140`)
+## 2. Phase 6 acceptance criteria (`phases.md`)
 
 | # | Criterion | Status | Evidence |
-|---|-----------|--------|----------|
-| 1 | Full test suite and Ruff pass | **PASS** | `pytest`: 152 passed, 0 failed, exit code 0<br>`ruff check .`: "All checks passed!", exit code 0 |
-| 2 | Fresh local setup instructions tested | **PASS** | Verified: `python -m venv .venv`, `.venv\Scripts\Activate.ps1`, `pip install -r requirements.txt`, `streamlit run app.py` all work on Windows PowerShell |
-| 3 | No real taxpayer data or secrets in repository | **PASS** | Searched all committed files for GSTIN patterns; no real taxpayer data found. `.env.example` has placeholders only. |
-| 4 | GST-rule limitations and CA-review requirement disclosed | **PASS** | `rules.md:§4`: "Do not present unverified tax assumptions as legal certainty. Mark them for CA verification."<br>`requirements.md:§60`: "The app runs locally from documented setup instructions without an LLM key."<br>`README.md:Important limitations`: GST rules require CA validation. |
-| 5 | Demo can be repeated from a clean start | **PASS** | Verified: cleared `data/runs/test_*` directories and re-ran full pipeline; results identical. Session state is ephemeral but file-based `data/runs/<run_id>/` model preserves per-run artifacts. |
+|---|---|---|---|
+| 1 | Full test suite and Ruff pass | **PASS** | 215 passed, exit 0; `ruff` clean, exit 0 |
+| 2 | Fresh local setup instructions tested | **PASS** | Fresh isolated venv: install exit 0; 215 tests, Ruff, verifier, health check all pass |
+| 3 | No real taxpayer data or secrets | **PASS** | Secret-pattern scan clean; committed pytest artifacts removed; `.env` ignored |
+| 4 | GST-rule limitations and CA-review requirement disclosed | **PASS** | `README.md`, `rules.md`, UI disclaimers, deployment report |
+| 5 | Demo repeatable from a clean start | **PASS** | `scripts/verify_pipeline.py` 20/20; AppTest workflow |
 
 ---
 
-## 3. Exact Commands, Results, Test Counts, and Exit Codes
+## 3. Commands and results
 
-### 3.1 Pytest
+| Command | Result | Exit |
+|---|---|---:|
+| `python -m pytest -q` | 215 passed in ~23 s | 0 |
+| `python -m ruff check .` | All checks passed! | 0 |
+| `python scripts/verify_pipeline.py` | 20/20 checks passed | 0 |
+| `streamlit run src/itc_sentinel/app.py` (headless, port 8518) | `/_stcore/health` → `ok` (200); `/` → 200 | 0 (stopped after check) |
 
-```powershell
-.venv\Scripts\python.exe -m pytest
-```
-
-**Result:** `collected 152 items, 152 passed, 0 failed`  
-**Exit code:** `0`
-
-### 3.2 Ruff
-
-```powershell
-.venv\Scripts\ruff.exe check .
-```
-
-**Result:** `All checks passed!`  
-**Exit code:** `0`
-
-### 3.3 Clean-Start Reproducibility Test
-
-```powershell
-rm -rf data/runs/test_clean_start
-# Then:
-.venv\Scripts\python.exe verify_phase6.py
-```
-
-**Results recorded in Section 4 of this report.**
-
-### 3.4 Streamlit Launch
-
-```powershell
-streamlit run src/itc_sentinel/app.py
-```
-
-**Result:** App launches at `http://localhost:8501`; end-to-end smoke test completes successfully.
+Test breakdown and full verifier output: `audit/test_results.md`.
 
 ---
 
-## 4. Verification Evidence
+## 4. Verification evidence
 
-### 4.1 Clean-Start Reproducibility Test
+### 4.1 Ground truth
 
-All checks from `verify_phase6.py`:
-
-| # | Check | Result |
-|---|-------|--------|
-| 1 | Ground-truth match distribution | PASS (exact=2, fuzzy=1, amount_mismatch=1, tax_head_mismatch=1, duplicate=1, invalid=1, probable=1, unmatched_books=1, unmatched_gstr2b=1) |
-| 2 | Export generates workbook | PASS (3 sheets: Summary, Reconciliation, Decisions) |
-| 3 | Vendor drafts generated | PASS (5 categories: invalid_data, duplicate, amount_mismatch, tax_head_mismatch, missing_in_2b) |
-| 4 | Audit events recorded | PASS (2 events: RUN_STARTED + RUN_COMPLETED) |
-| 5 | Synthetic data only (no real GSTINs) | PASS |
-| 6 | Eligibility statuses provisional (UNCERTAIN/not_assessed) | PASS |
-| 7 | Review requirements correctly assigned | PASS (by design) |
-| 8 | No auto-claimed ITC eligibility | PASS |
-| 9 | Excel formula-injection protection | PASS |
-
-### 4.2 Security, Privacy, and Tax Limitations Verification
-
-| # | Check | Result |
-|---|-------|--------|
-| 1 | No real taxpayer data (GSTINs) in committed files | PASS |
-| 2 | LLM_ENABLED env var = 0 (disabled by default) | PASS |
-| 3 | LLM cannot change reconciliation decisions or numeric results | PASS (by code design) |
-| 4 | Audit logging is local JSONL demo trail | PASS (by code design) |
-| 5 | No automated GST filing, payment holds, email sending | PASS (no FastAPI, SMTP, Twilio) |
-| 6 | Upload/export limitations disclosed | PASS |
-| 7 | No API keys or secrets hardcoded in source | PASS |
-
-### 4.3 End-to-End Workflow Verification
-
-Verified through the Streamlit UI:
-
-- File upload (synthetic or user CSV/XLSX + JSON) → pipeline runs on explicit ▶️ Run action
-- Summary tab: KPIs with provisional exposure labels, match status breakdown, uncertainty disclaimer
-- Exceptions tab: filterable worklist; probable/low_confidence never treated as confirmed
-- Vendor Messages tab: 6 deterministic template drafts; each requires human editing; no auto-send
-- Export & Audit tab: Excel workbook download with 3 core sheets; audit trail (local JSONL); review decision recording
-- Rerun without clearing state: duplicate review/audit events prevented via run_id-based audit log paths
-
----
-
-## 5. Security, Privacy, and Tax Limitations
-
-| Limitation | Detail |
+| Check | Result |
 |---|---|
-| **GST rules** | Configurable assumptions until reviewed by CA. All eligibility statuses `UNCERTAIN` pending verification. |
-| **Match ≠ ITC eligibility** | A reconciliation match does **not** establish ITC eligibility. Design explicit: `eligibility_status = UNCERTAIN` for all match statuses. |
-| **Discrepancy ≠ wrongdoing** | A discrepancy alone does **not** establish wrongdoing. |
-| **Real taxpayer data** | None committed to repository. Synthetic data only in tests and demos. |
-| **LLM** | Opt-in via `ITC_SENTINEL_LLM_ENABLED=1` env var. Disabled by default. Cannot change numeric values or decisions; template fallback when disabled. |
-| **Automated actions** | No GST filing, payment holds, email/WhatsApp sending, or external communications. Drafts require human edit. |
-| **Audit trail** | Append-only JSONL is demo-grade, not tamper-proof or legally compliant. Stated explicitly in `audit.py` docstring. |
-| **Session state** | Streamlit session state is ephemeral; closing browser resets run_id, review decisions, and audit events for the current session. Prior `data/runs/<run_id>/` directories persist unless deleted. |
-| **Upload format** | Declared GSTR-2B JSON contract is an assumption pending confirmation against real exports. Not claimed to cover all variants. |
-| **Excel export** | Formula-injection protection (`safe_cell_value()`) escapes cells starting `=`, `+`, `-`, `@`. Not a substitute for production-grade data validation. |
+| Book-row statuses vs `ground_truth.json` | PASS (exact=2, fuzzy=1, amount_mismatch=1, tax_head_mismatch=1, duplicate=1, invalid=1, probable=1, unmatched_books=1, unmatched_gstr2b=1) |
+| Confirmed precision / recall | PASS (1.0 / 1.0) |
+| Metrics | PASS (10 reconciliation rows, 16 source rows, confirmed=2, review-required=9, exposure ₹8,890.00) |
+
+### 4.2 Workflow (AppTest)
+
+- Sample run produces the expected dashboard and audit events.
+- Uploaded CSV + JSON run succeeds; upload directory is empty afterwards.
+- Invalid CSV/JSON show actionable errors; a failed run can be followed by a
+  successful one.
+- Empty dataset produces zero metrics without exceptions.
+- Review approval records `books:0` with `previous_state="none"` and an audit
+  event; duplicate `books:5` keeps a distinct identity.
+- Invalid `books:6` offers only Reject/Pending.
+- Export produces a non-empty XLSX and an `export_created` event.
+- Re-running rotates `run_id`, clears reviews, and recomputes metrics.
+
+### 4.3 Safety
+
+| Check | Result |
+|---|---|
+| Formula injection escaped (including leading whitespace) | PASS |
+| Upload type/size/traversal/empty checks | PASS |
+| Temp uploads deleted on success and failure | PASS |
+| Invalid rows cannot be approved | PASS |
+| Exact matches are candidates, not claims | PASS |
+| No automated filing/payment/message actions | PASS |
+| Audit described as demo-grade | PASS |
 
 ---
 
-## 6. Files Changed and Reasons
+## 5. Remaining conditions
 
-| File | Change | Reason |
-|------|--------|--------|
-| `README.md` | Updated and expanded | Added full run workflow, limitations, session state behavior, project structure through Phase 5 |
-| `tasks.md` | Updated progress to 67% | Added Phase 5 tasks P5-01/P5-02/P5-03 as Complete, added Phase 6 acceptance criteria and verification evidence |
-| `memory.md` | Updated current phase and status | Reflected Phase 5 completion, added Phase 5 module responsibilities, updated environment verification, added known issues |
-| `src/itc_sentinel/app.py` | New file | Streamlit MVP UI (Phase 5) — full end-to-end user workflow |
-| No existing Phase 0–4 modules were modified | — | All Phase 0–5 business logic preserved as-is |
-
----
-
-## 7. Remaining Blockers and Recommended Next Steps
-
-| Blockers | Status | Recommendation |
+| Condition | Status | Recommendation |
 |---|---|---|
-| Phase 6 mandatory criteria all pass | ✅ Complete | Demo is ready for authorized review |
-| Production readiness | ❌ Not claimed | Requires CA-validated rules, persistent database, authentication/authorization, dependency hardening — outside initial MVP scope |
-| Real-file GSTR-2B schema validation | ⚠️ Unconfirmed | Declared contract in `ingest.py` is an assumption; confirm against anonymized real export if needed |
-| Multi-user / persistent review state | ❌ Out of scope | Deferred to post-MVP (phases.md:142–145) |
-
-**Recommended next steps (per phases.md:141, Post-MVP backlog):**
-- Persistent database and multi-client support
-- Authentication/RBAC and tenant isolation
-- Additional GST documents, amendments, credit notes, and OCR
-- Approved external integrations
-- API service, background jobs, monitoring, and production hardening
+| CA validation of tax rules (P3-01) | Open — external | Required before any real-data use |
+| GSTR-2B JSON schema | Assumption | Confirm against anonymized real exports |
+| Committed pytest artifacts | Removed from working tree; tracked in `HEAD` | `git rm -r --cached pytest-of-rinku` at commit time |
+| Production hardening | Out of scope | Auth/RBAC, persistence, tamper-evident audit, CI/CD, monitoring |
 
 ---
 
-## 8. Demo Readiness vs Production Readiness
+## 6. Relationship to other audit artifacts
 
-| Aspect | Demo Readiness | Production Readiness |
-|---|---|---|
-| **Test suite** | ✅ 152/152 pass | ❓ Would need expanded test coverage including edge cases, real-data validation |
-| **UI workflow** | ✅ Complete end-to-end | ❓ Would need accessibility, multi-tenant, responsive design |
-| **Data pipeline** | ✅ Synthetic data verified | ❓ Would need real GSTR-2B schema validation, OCR, error handling |
-| **Security** | ✅ No secrets, LLM opt-in | ❓ Would need production-grade secrets management, authentication, audit immutability |
-| **Tax rules** | ✅ Explicitly provisional | ❓ Would need CA-validated rules, dynamic rule loading, compliance checks |
-| **Deployment** | ✅ `streamlit run app.py` local | ❓ Would need Docker, process managers, monitoring, CI/CD, dependency scanning |
-| **Compliance** | ✅ Disclosed limitations | ❓ Would need legal review, data protection impact assessment, audit readiness |
-
-**Final verdict:** ITC Sentinel Phase 5 Streamlit MVP is **demo-ready** — a reproducible, deterministic, locally-running reconciliation demonstration with explicit uncertainty labeling, synthetic-ground-truth validation, and all safety boundaries enforced. It is **not production-ready** and should not be positioned as such without CA-validated rules, persistent storage, authentication, and compliance hardening.
+- `audit/core_pipeline_verification.md` — stage-by-stage pipeline evidence.
+- `audit/phase_completion_matrix.md` — phase criteria and statuses.
+- `audit/test_results.md` — commands, counts, and failure resolutions.
+- `audit/implementation_backlog.md` — prioritized open work.
+- `audit/deployment_readiness.md` — final verdict and conditions.
+- `audit/final_change_summary.md` — files changed and behavior changes.
 
 ---
 
-## 9. Confirmation of No Phase 6 Feature Addition
+## 7. Confirmation of scope discipline
 
-No new product features, architectural expansions, or unrelated refactoring were introduced in Phase 6. All work was verification, documentation, and reporting against the existing Phase 5 implementation and `phases.md` acceptance criteria.
+No new product architecture was introduced. Work was limited to defect fixes,
+regression tests, verification, and documentation reconciliation. No Git commits
+or deployments were made. No real taxpayer data or credentials were added.
 
-**No Git commits were made** during this Phase 6 session. All files remain in their existing state on the untracked `master` branch.
-
----
-
-**Report generated:** 2026-10-22  
-**Next Phase:** Awaiting explicit authorization for Phase 7 (Post-MVP backlog) or project closeout.  
-**Contact:** Project owner authorization required before proceeding.
+**Next step:** project owner authorizes (a) a commit/recovery point and (b) the
+conditions in `audit/deployment_readiness.md` before any external demo.

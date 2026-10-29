@@ -104,6 +104,12 @@ class ReviewRecord:
         reviewer_name: Optional reviewer identifier (no secrets).
         timestamp: ISO 8601 UTC timestamp when the decision was recorded.
         decision_metadata: Additional structured data.
+        record_id: Stable internal record identifier (preferred over
+            ``invoice_key`` for associating a review with a reconciliation
+            result, because duplicate invoice identifiers can repeat).
+        previous_state: Review state before this action (``"none"`` for a
+            first review).
+        new_state: Review state recorded by this action.
     """
 
     review_id: str
@@ -116,6 +122,9 @@ class ReviewRecord:
     reviewer_name: str = ""
     timestamp: str = ""
     decision_metadata: dict[str, Any] = field(default_factory=dict)
+    record_id: str = ""
+    previous_state: str = ""
+    new_state: str = ""
 
 
 # ---------------------------------------------------------------------------

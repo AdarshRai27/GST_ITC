@@ -1,2 +1,0 @@
-{"event_id":"e1","event_type":"run_started","invoice_key":null,"metadata":{},"run_id":"run-1","summary":"started","timestamp":"2024-04-15T10:00:00+00:00"}
-{"event_id":"e2","event_type":"decision_recorded","invoice_key":"29ABCDE1234F1Z5|INV-001","metadata":{},"run_id":"run-1","summary":"decision recorded","timestamp":"2024-04-15T10:01:00+00:00"}

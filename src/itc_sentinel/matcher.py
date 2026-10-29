@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 
 from rapidfuzz import fuzz
@@ -35,6 +35,7 @@ __all__ = [
     "MatchResult",
     "ReconciliationResult",
     "reconcile",
+    "record_identity",
 ]
 
 
@@ -116,6 +117,10 @@ class MatchResult:
             or None when not applicable or either amount is missing.
         tax_head_difference: True when tax is under a different head
             (e.g. CGST+SGST vs IGST) between the two records.
+        record_id: Stable internal identity for this result. It is derived
+            from the source side and source row, so duplicate invoice
+            identifiers cannot collide. Empty for hand-constructed results;
+            use :func:`record_identity` to obtain a deterministic fallback.
     """
 
     purchase_record: NormalizedRecord | None
@@ -126,6 +131,7 @@ class MatchResult:
     discrepancies: list[str] = field(default_factory=list)
     amount_difference: Decimal | None = None
     tax_head_difference: bool = False
+    record_id: str = ""
 
 
 @dataclass
@@ -220,6 +226,26 @@ class ReconciliationResult:
         return counts
 
 
+def record_identity(match: MatchResult) -> str:
+    """Return a stable internal identifier for a reconciliation result.
+
+    The identifier is derived from the primary source side and the source row,
+    not from the GSTIN/invoice display label. Two purchase-register rows that
+    share a GSTIN and invoice number (for example a duplicate row) therefore
+    receive different identities.
+
+    The fallback path keeps hand-constructed :class:`MatchResult` objects
+    usable in tests while still producing a deterministic label.
+    """
+    if match.record_id:
+        return match.record_id
+    if match.purchase_record is not None:
+        return f"books:{match.purchase_record.source_row}"
+    if match.gstr2b_record is not None:
+        return f"gstr2b:{match.gstr2b_record.source_row}"
+    return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -286,7 +312,7 @@ def _amount_difference(
     if a.taxable_value is None or b.taxable_value is None:
         return None
     return (a.taxable_value - b.taxable_value).quantize(
-        MONEY_PLACES
+        MONEY_PLACES, rounding=ROUND_HALF_UP
     )
 
 
@@ -427,12 +453,19 @@ def _evaluate_pair(
                 amt_diff,
                 True,
             )
+        differing_fields = ", ".join(discrepancies) if discrepancies else (
+            "monetary values"
+        )
         return _Candidate(
             book,
             gstr,
             MatchStatus.AMOUNT_MISMATCH,
             0.9,
-            "Same GSTIN and invoice number, but monetary values differ.",
+            (
+                "Same GSTIN and invoice number, but fields differ: "
+                f"{differing_fields}. Review the discrepancy details before "
+                "any ITC action."
+            ),
             discrepancies,
             amt_diff,
             False,
@@ -448,20 +481,21 @@ def _evaluate_pair(
         g_core = _invoice_core(g_inv)
         if b_core and g_core and b_core == g_core and b_inv != g_inv:
             similarity = _invoice_similarity(b_inv, g_inv)
-            discrepancies = _discrepancies(book, gstr, settings)
-            tax_head = _tax_head_mismatch(book, gstr)
-            amt_diff = _amount_difference(book, gstr)
-            conf = similarity / 100.0
-            return _Candidate(
-                book,
-                gstr,
-                MatchStatus.FUZZY,
-                conf,
-                f"Fuzzy invoice-number match (similarity {similarity:.0f}).",
-                discrepancies,
-                amt_diff,
-                tax_head,
-            )
+            if similarity >= settings.fuzzy_threshold:
+                discrepancies = _discrepancies(book, gstr, settings)
+                tax_head = _tax_head_mismatch(book, gstr)
+                amt_diff = _amount_difference(book, gstr)
+                conf = similarity / 100.0
+                return _Candidate(
+                    book,
+                    gstr,
+                    MatchStatus.FUZZY,
+                    conf,
+                    f"Fuzzy invoice-number match (similarity {similarity:.0f}).",
+                    discrepancies,
+                    amt_diff,
+                    tax_head,
+                )
         similarity = _invoice_similarity(b_inv, g_inv)
         if similarity >= settings.probable_threshold:
             return _Candidate(
@@ -527,6 +561,7 @@ def reconcile(
                 discrepancies=[
                     i.field for i in r.validation_issues
                 ],
+                record_id=f"books:{r.source_row}",
             )
         )
     for r in invalid_gstr2b:
@@ -540,6 +575,7 @@ def reconcile(
                 discrepancies=[
                     i.field for i in r.validation_issues
                 ],
+                record_id=f"gstr2b:{r.source_row}",
             )
         )
 
@@ -575,6 +611,7 @@ def reconcile(
                     f"invoice {r.invoice_number} already seen."
                 ),
                 discrepancies=["duplicate_invoice"],
+                record_id=f"books:{r.source_row}",
             )
         )
 
@@ -613,6 +650,7 @@ def reconcile(
                 discrepancies=cand.discrepancies,
                 amount_difference=cand.amount_difference,
                 tax_head_difference=cand.tax_head_difference,
+                record_id=f"books:{cand.purchase_record.source_row}",
             )
         )
 
@@ -626,6 +664,7 @@ def reconcile(
                     match_status=MatchStatus.UNMATCHED_BOOKS,
                     confidence=0.0,
                     reason="No matching GSTR-2B invoice found for this GSTIN and invoice.",
+                    record_id=f"books:{r.source_row}",
                 )
             )
 
@@ -638,6 +677,7 @@ def reconcile(
                     match_status=MatchStatus.UNMATCHED_GSTR2B,
                     confidence=0.0,
                     reason="No matching purchase-register invoice found for this GSTIN and invoice.",
+                    record_id=f"gstr2b:{r.source_row}",
                 )
             )
 

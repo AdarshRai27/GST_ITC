@@ -173,13 +173,16 @@ def test_decide_exact_match():
     match = _make_match(0, MatchStatus.EXACT)
     decision = decide(match)
     _assert_decision_fields(decision)
-    assert decision.action == Action.CLAIM_ITC
+    assert decision.action == Action.PROPOSE_ITC_CLAIM
     assert decision.priority == Priority.LOW
     assert decision.flags == []
     assert decision.reason_code == ReasonCode.EXACT_MATCH
     assert decision.exposure_amount == Decimal("0")
-    assert decision.review_required is False
+    # An exact match is only a candidate for a claim: eligibility is still
+    # UNCERTAIN (rules are not CA-validated), so human review is mandatory.
+    assert decision.review_required is True
     assert decision.eligibility_status == EligibilityStatus.UNCERTAIN
+    assert "candidate" in decision.reason.lower()
     assert "R-MATCH-EXACT" in decision.rule_sources_applied
     assert "R-ITC-ELIGIBILITY" in decision.rule_sources_applied
 
@@ -397,7 +400,7 @@ def test_decide_all_with_iterable():
 def test_total_exposure_sums_without_double_counting():
     d1 = DecisionResult(
         match_result=_make_match(0, MatchStatus.EXACT),
-        action=Action.CLAIM_ITC,
+        action=Action.PROPOSE_ITC_CLAIM,
         priority=Priority.LOW,
         exposure_amount=Decimal("0"),
     )

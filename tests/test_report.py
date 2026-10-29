@@ -144,6 +144,12 @@ def test_safe_cell_value_formula_prefixes():
     assert safe_cell_value("\t=1+1") == "'\t=1+1"
 
 
+def test_safe_cell_value_leading_whitespace_formula():
+    # Some importers trim leading whitespace before evaluating formulas.
+    assert safe_cell_value("  =1+1") == "'  =1+1"
+    assert safe_cell_value("   @SUM(A1)") == "'   @SUM(A1)"
+
+
 def test_safe_cell_value_empty_and_none():
     assert safe_cell_value("") == ""
     assert safe_cell_value(None) is None
@@ -191,6 +197,28 @@ def test_export_workbook_reopen_and_verify(tmp_path):
     assert "action" in headers
     assert "reason_code" in headers
     assert "review_required" in headers
+
+
+def test_summary_uses_stable_status_codes_and_confirmed_definition(tmp_path):
+    decisions = [
+        _make_decision(MatchStatus.EXACT),
+        _make_decision(MatchStatus.AMOUNT_MISMATCH),
+    ]
+    path = tmp_path / "summary.xlsx"
+    export_workbook(str(path), decisions)
+
+    wb = load_workbook(path)
+    values = [
+        str(value)
+        for row in wb["Summary"].iter_rows(values_only=True)
+        for value in row
+        if value is not None
+    ]
+
+    assert "exact" in values
+    assert "amount_mismatch" in values
+    assert not any(value.startswith("MatchStatus.") for value in values)
+    assert "Confirmed matches (exact only)" in values
 
 
 def test_export_workbook_empty_decisions(tmp_path):
@@ -277,7 +305,7 @@ def test_export_protects_formula_injection(tmp_path):
     match.reason = "=1+1 malicious"
     decision = DecisionResult(
         match_result=match,
-        action=Action.CLAIM_ITC,
+        action=Action.PROPOSE_ITC_CLAIM,
         priority=Priority.LOW,
         flags=[],
         reason="=1+1 malicious",
@@ -309,7 +337,7 @@ def test_export_monetary_precision(tmp_path):
     match.amount_difference = Decimal("500.005")  # rounds to 500.01
     decision = DecisionResult(
         match_result=match,
-        action=Action.CLAIM_ITC,
+        action=Action.PROPOSE_ITC_CLAIM,
         priority=Priority.LOW,
         flags=[],
         reason="test",

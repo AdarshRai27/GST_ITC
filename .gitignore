@@ -50,3 +50,8 @@ data/runs/
 .coverage
 htmlcov/
 .tox/
+# Local pytest temp roots and pip build scratch directories
+pytest-of-*/
+pip-build-tracker-*/
+pip-ephem-wheel-cache-*/
+pip-install-*/
