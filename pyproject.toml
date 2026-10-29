@@ -1,8 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "itc-sentinel"
 version = "0.1.0"
 description = "ITC Sentinel — GST Input Tax Credit reconciliation MVP"
 requires-python = ">=3.11"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["itc_sentinel*"]
 
 [tool.ruff]
 line-length = 100
@@ -17,7 +28,3 @@ testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-
-
-[tool.setuptools.packages.find]
-where = ["src"]
